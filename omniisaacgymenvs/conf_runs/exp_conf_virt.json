@@ -1,0 +1,27 @@
+{
+  "experiment11": {
+    "experiment": "virtual_GoToXY_actPenalty",
+    "task": "virtual_floating_platform/MFP2D_Virtual_GoToXY",
+    "train": "MFP2D_PPOmulti_dict_MLP",
+    "headless": "True",
+    "task.sim.dt": "0.02",
+    "num_envs": "4096",
+    "max_iterations": "2000",
+    "wandb_activate": "True",
+    "wandb_entity": "matteohariry",
+    "wandb_project": "MFP2D_Virtual_Penalty"
+    },
+
+    "experiment12": {
+      "experiment": "virtual_GoToPose",
+      "task": "virtual_floating_platform/MFP2D_Virtual_GoToPose",
+      "train": "MFP2D_PPOmulti_dict_MLP",
+      "headless": "True",
+      "task.sim.dt": "0.02",
+      "num_envs": "4096",
+      "max_iterations": "2000",
+      "wandb_activate": "True",
+      "wandb_entity": "matteohariry",
+      "wandb_project": "MFP2D_Virtual_Penalty"
+    }
+}

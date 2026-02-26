@@ -1,0 +1,20 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug with Isaac Sim Python",
+            "type": "python",
+            "request": "launch",
+            "python": "/data/ytj/isaac_sim-2023.1.1/python.sh",  
+            "program": "/data/ytj/OmniIsaacGymEnvs/omniisaacgymenvs/scripts/rlgames_train.py",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "args": [
+                "task=USV/IROS2024/USV_Virtual_CaptureXY_SysID-TEST",
+                "train=USV/USV_PPOcontinuous_MLP",
+                "headless=True",
+                "num_envs=512"
+            ]
+        }
+    ]
+}

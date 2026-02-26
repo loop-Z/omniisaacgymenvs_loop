@@ -1,0 +1,41 @@
+environment:
+  # ---- loopz 实际读取（影响训练逻辑）----
+  baseDim: 27
+  geomDim: 0
+  n_futures: 1
+  # ---- USV 观测协议切分（用于后续替换 baseDim/geomDim 语义）----
+  # 速度信息：线速度(2) + 角速度(1)
+  speed_dim: 3
+  # 质量质心：mass(1) + CoM(x,y,z)
+  mass_dim: 4
+  control_dt: 0.01
+  max_time: 6.0
+  eval_every_n: 2000
+  unnormalize_speed_vec: false
+
+  # ---- 可能用于“特权信息/辨识/随机化”的开关（当前 loopz 不使用，但保留以便后续扩展）----
+  use_priv_vel: true
+  privinfo: true
+  includeGRF: false
+  randomize_friction: true
+  randomize_mass: true
+  randomize_motor_strength: true
+  randomize_gains: true
+  randomize_yaw: false
+
+architecture:
+  # ---- loopz 实际读取（影响网络结构/输入切片）----
+  policy_net: [128, 128]
+  value_net: [128, 128]
+  layer_type: feedforward
+  activation: tanh
+  small_init: false
+
+  # ---- USV：质量/质心编码器超参（可选）----
+  # mass_encoder 会先把 [mass, com] 编码为 latent，再与 speed/task 拼接送入主干 MLP
+  mass_latent_dim: 8
+  mass_encoder_shape: [64, 16]
+
+  freeze_encoder: false
+  speed_vec_start_idx: 42
+  speed_vec_end_idx: 46

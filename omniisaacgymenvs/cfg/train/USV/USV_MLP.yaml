@@ -1,0 +1,17 @@
+params:
+  # loopz 当前只读取 train.params.config.name / max_epochs
+  seed: ${...seed}
+
+  config:
+    name: ${resolve_default:USV,${....experiment}}
+    full_experiment_name: ${.name}
+    device: ${....rl_device}
+    max_epochs: ${resolve_default:3000,${....max_iterations}}
+
+    # 下面这些 PPO 超参目前在 loopz 里仍是硬编码，但保留在 yaml 里便于后续迁移成“配置驱动”
+    gamma: 0.99
+    tau: 0.95
+    learning_rate: 1e-4
+    horizon_length: 16
+    minibatch_size: 8192
+    mini_epochs: 8
