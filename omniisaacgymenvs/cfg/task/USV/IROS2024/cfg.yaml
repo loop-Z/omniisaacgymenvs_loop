@@ -11,6 +11,9 @@ environment:
   control_dt: 0.01
   max_time: 6.0
   eval_every_n: 2000
+  # Checkpoint saving interval in env-steps (global_frame).
+  # With num_envs=512 and horizon_length=16, 4_096_000 ~= every 500 updates.
+  save_every_env_steps: 4096000
   unnormalize_speed_vec: false
 
   # ---- 可能用于“特权信息/辨识/随机化”的开关（当前 loopz 不使用，但保留以便后续扩展）----

@@ -1,0 +1,133 @@
+{
+    "os": "Linux-6.8.0-100-generic-x86_64-with-glibc2.35",
+    "python": "3.10.13",
+    "heartbeatAt": "2026-03-06T08:24:56.665371",
+    "startedAt": "2026-03-06T08:24:53.484324",
+    "docker": null,
+    "cuda": null,
+    "args": [
+        "task=USV/IROS2024/USV_Virtual_CaptureXY_SysID-TEST",
+        "+train=USV/USV_MLP",
+        "headless=True",
+        "num_envs=512"
+    ],
+    "state": "running",
+    "program": "/home/loop/isaac_sim-2023.1.1/OmniIsaacGymEnvs/omniisaacgymenvs/scripts/rlgames_train_loopz.py",
+    "codePathLocal": "omniisaacgymenvs/scripts/rlgames_train_loopz.py",
+    "codePath": "omniisaacgymenvs/scripts/rlgames_train_loopz.py",
+    "git": {
+        "remote": "git@github.com:loop-Z/omniisaacgymenvs_loop.git",
+        "commit": "3ddc7da3a38a8c3edc71040fe0ca09d731f9556a"
+    },
+    "email": "loopzhang7@163.com",
+    "root": "/home/loop/isaac_sim-2023.1.1/OmniIsaacGymEnvs",
+    "host": "loop-ws",
+    "username": "loop",
+    "executable": "/home/loop/isaac_sim-2023.1.1/kit/python/bin/python3",
+    "cpu_count": 8,
+    "cpu_count_logical": 16,
+    "cpu_freq": {
+        "current": 4456.165,
+        "min": 800.0,
+        "max": 5100.0
+    },
+    "cpu_freq_per_core": [
+        {
+            "current": 4700.008,
+            "min": 800.0,
+            "max": 5100.0
+        },
+        {
+            "current": 4701.604,
+            "min": 800.0,
+            "max": 5100.0
+        },
+        {
+            "current": 4701.602,
+            "min": 800.0,
+            "max": 5100.0
+        },
+        {
+            "current": 4698.56,
+            "min": 800.0,
+            "max": 5100.0
+        },
+        {
+            "current": 4697.894,
+            "min": 800.0,
+            "max": 5100.0
+        },
+        {
+            "current": 4698.923,
+            "min": 800.0,
+            "max": 5100.0
+        },
+        {
+            "current": 4700.021,
+            "min": 800.0,
+            "max": 5100.0
+        },
+        {
+            "current": 800.0,
+            "min": 800.0,
+            "max": 5100.0
+        },
+        {
+            "current": 4700.956,
+            "min": 800.0,
+            "max": 5100.0
+        },
+        {
+            "current": 4693.311,
+            "min": 800.0,
+            "max": 5100.0
+        },
+        {
+            "current": 4699.332,
+            "min": 800.0,
+            "max": 5100.0
+        },
+        {
+            "current": 4705.857,
+            "min": 800.0,
+            "max": 5100.0
+        },
+        {
+            "current": 4699.036,
+            "min": 800.0,
+            "max": 5100.0
+        },
+        {
+            "current": 4691.576,
+            "min": 800.0,
+            "max": 5100.0
+        },
+        {
+            "current": 4697.297,
+            "min": 800.0,
+            "max": 5100.0
+        },
+        {
+            "current": 4697.61,
+            "min": 800.0,
+            "max": 5100.0
+        }
+    ],
+    "disk": {
+        "/": {
+            "total": 884.7991104125977,
+            "used": 218.29234313964844
+        }
+    },
+    "gpu": "NVIDIA GeForce RTX 3070",
+    "gpu_count": 1,
+    "gpu_devices": [
+        {
+            "name": "NVIDIA GeForce RTX 3070",
+            "memory_total": 8589934592
+        }
+    ],
+    "memory": {
+        "total": 31.276775360107422
+    }
+}

@@ -22,6 +22,12 @@ env:
   clipObservations: {state: 12.0}
   clipActions: 1.0
 
+  action_processing:
+    use_affine_thrust_mapping: True
+    initial_action_bias: -0.6
+    initial_action_bias_steps: 20000
+    penalties_use_thrust_u: True
+
   # Split the maximum amount of thrust across all thrusters.
   split_thrust: False
 
@@ -73,8 +79,8 @@ env:
       heading_noise_max:  0.025 # default - 0.025 rad
 
     actions:
-      # Add noisy actions
-      add_noise_on_act: True
+      # Add noisy actions  TODO:True
+      add_noise_on_act: False
       min_action_noise: -0.05
       max_action_noise:  0.05
 
@@ -146,19 +152,28 @@ env:
 
   penalties_parameters:
     penalize_energy: True
-    penalize_energy_fn: "lambda x,step : (torch.exp(-torch.sum(x**2, dim=-1)) - 1.0) * 0.01" 
+    penalize_energy_fn: "lambda x,step : -torch.sum(x, dim=-1) * 0.005-0.05"
     penalize_energy_c1: 0.00 # Not used in this version
     penalize_energy_c2: 0.00 # Not used in this version
     penalize_linear_velocities: False
     penalize_linear_velocities_fn: "lambda x,step: -torch.norm(x, dim=-1)*0.01"
     penalize_linear_velocities_c1: 0.00 # Not used in this version
     penalize_linear_velocities_c2: 0.00 # Not used in this version
-    penalize_angular_velocities: False
-    penalize_angular_velocities_fn: "lambda x,step : -torch.abs(x)*0.01 + 0.0"
+    penalize_angular_velocities: True
+    # --- OLD (amplitude penalty, no deadzone) ---
+    # penalize_angular_velocities_fn: "lambda x,step : -torch.abs(x)*0.01 + 0.0"
+    # --- NEW (方案3): amplitude penalty with deadzone (suppresses long-time turning) ---
+    # w0 = 0.4 rad/s (<=w0 no penalty); kw = 0.02 (light)
+    penalize_angular_velocities_fn: "lambda x,step: -torch.clamp(torch.abs(x) - 0.4, min=0.0) * 0.02"
     penalize_angular_velocities_c1: 0.00 # Not used in this version
     penalize_angular_velocities_c2: 0.00 # Not used in this version
     penalize_angular_velocities_variation: True
-    penalize_angular_velocities_variation_fn: "lambda x,step: (torch.exp(-0.033 * torch.abs(x)) - 1.0) * 1.0"
+    # --- OLD (variation penalty, exponential) ---
+    # penalize_angular_velocities_variation_fn: "lambda x,step: (torch.exp(-0.033 * torch.abs(x)) - 1.0) * 0.2"
+    # --- NEW (方案3): weak variation penalty with deadzone (anti-jitter) ---
+    # x here is dω = ω_t - ω_{t-1}
+    # dw0 = 0.10 rad/s; k = 0.005 (very light)
+    penalize_angular_velocities_variation_fn: "lambda x,step: -torch.clamp(torch.abs(x) - 0.10, min=0.0) * 0.005"
     penalize_angular_velocities_variation_c1: 0.00 # Not used in this version
     penalize_angular_velocities_variation_c2: 0.00 # Not used in this version
     penalize_action_variation: False
@@ -252,16 +267,19 @@ sim:
 dynamics:
   thrusters:
     cmd_lower_range: -1.0
+    # cmd_lower_range: 0.0
     cmd_upper_range: 1.0
     timeConstant: 0.05
     interpolation: 
       numberOfPointsForInterpolation: 1000
       # CMD                                 -1.0, -0.9, -0.8, -0.7, -0.6,-0.5,-0.4,-0.3,-0.2,-0.1, 0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6,  0.7,  0.8,  0.9,  1.0]
-      interpolationPointsFromRealDataLeft: [40.0, -36.0, -32.0, -28.0, -24.0, -20.0, -16.0, -12.0, -8.0, -4.0, 0.0, 8.0, 16.0, 24.0, 32.0, 40.0, 48.0, 56.0, 64.0, 72.0, 80.0]
+      # interpolationPointsFromRealDataLeft: [-40.0, -36.0, -32.0, -28.0, -24.0, -20.0, -16.0, -12.0, -8.0, -4.0, 0.0, 8.0, 16.0, 24.0, 32.0, 40.0, 48.0, 56.0, 64.0, 72.0, 80.0]
+      interpolationPointsFromRealDataLeft: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 8.0, 16.0, 24.0, 32.0, 40.0, 48.0, 56.0, 64.0, 72.0, 80.0]
       # [-3.8, -3.8, -3.6, -3.6, -1.6, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 4.0, 10.0, 15.0, 21.0, 23.0, 22.0]
       # Nominal Thruster Model : [-19.88, -16.52, -12.6, -5.6, -1.4, 0.0, 2.24, 9.52, 21.28, 28.0, 33.6]
       # SID Thruster Model : [-3.8, -3.8, -3.6, -3.6, -1.6, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 4.0, 10.0, 15.0, 21.0, 23.0, 22.0]
-      interpolationPointsFromRealDataRight: [40.0, -36.0, -32.0, -28.0, -24.0, -20.0, -16.0, -12.0, -8.0, -4.0, 0.0, 8.0, 16.0, 24.0, 32.0, 40.0, 48.0, 56.0, 64.0, 72.0, 80.0]
+      # interpolationPointsFromRealDataRight: [-40.0, -36.0, -32.0, -28.0, -24.0, -20.0, -16.0, -12.0, -8.0, -4.0, 0.0, 8.0, 16.0, 24.0, 32.0, 40.0, 48.0, 56.0, 64.0, 72.0, 80.0]
+      interpolationPointsFromRealDataRight: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 8.0, 16.0, 24.0, 32.0, 40.0, 48.0, 56.0, 64.0, 72.0, 80.0]
       # [-5.0, -5.0, -5.0, -4.6, -2.2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 4.6, 10.0, 17.0, 24.0, 24.0, 23.0]
       # Nominal Thruster Model : [-19.88, -16.52, -12.6, -5.6, -1.4, 0.0, 2.24, 9.52, 21.28, 28.0, 33.6]
       # SID Thruster Model : [-5.0, -5.0, -5.0, -4.6, -2.2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 4.6, 10.0, 17.0, 24.0, 24.0, 23.0]

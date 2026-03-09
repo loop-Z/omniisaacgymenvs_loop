@@ -22,6 +22,12 @@ env:
   clipObservations: {state: 12.0}
   clipActions: 1.0
 
+  action_processing:
+    use_affine_thrust_mapping: True
+    initial_action_bias: -0.6
+    initial_action_bias_steps: 20000
+    penalties_use_thrust_u: True
+
   # Split the maximum amount of thrust across all thrusters.
   split_thrust: False
 
@@ -132,7 +138,7 @@ env:
 
   penalties_parameters:
     penalize_energy: True
-    penalize_energy_fn: "lambda x,step : (torch.exp(-torch.sum(x**2, dim=-1)) - 1.0) * 0.01" 
+    penalize_energy_fn: "lambda x,step : -torch.sum(x, dim=-1) * 0.01"
     penalize_energy_c1: 0.00 # Not used in this version
     penalize_energy_c2: 0.00 # Not used in this version
     penalize_linear_velocities: False

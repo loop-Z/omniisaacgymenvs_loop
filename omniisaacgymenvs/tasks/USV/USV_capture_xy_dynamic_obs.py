@@ -131,25 +131,34 @@ class CaptureXYTask(Core):
             self._num_envs, dtype=torch.float, device=self._device, requires_grad=False
         )
 
-        if not "distance_reward" in stats.keys():
-            stats["distance_reward"] = torch_zeros()
-        if not "alignment_reward" in stats.keys():
-            stats["alignment_reward"] = torch_zeros()
-        if not "position_error" in stats.keys():
-            stats["position_error"] = torch_zeros()
-        if not "boundary_penalty" in stats.keys():
-            stats["boundary_penalty"] = torch_zeros()
-        if not "boundary_dist" in stats.keys():
-            stats["boundary_dist"] = torch_zeros()
+        # NOTE: stats 的 key 会一路透传到 USV_Virtual.extras['episode']，并最终在训练端以
+        # TensorBoard/W&B 的 `Episode/<key>` 形式出现。
+        # Python dict 保留插入顺序；这里的顺序会影响日志展示的“观测顺序”。
+        # 约定：先放 reward 组成/关键分项，再放诊断量（不直接参与 reward 的量）。
 
-        if not "velocity_reward" in stats.keys():
-            stats["velocity_reward"] = torch_zeros()
-        if not "velocity_error" in stats.keys():
-            stats["velocity_error"] = torch_zeros()
-        if not "potential_shaping_reward" in stats.keys():
+        # ---------------- Reward components (preferred) ----------------
+        # NOTE: 为了让 TensorBoard/W&B 的 Episode/ 面板更聚焦，这里只保留关键项。
+        # 被隐藏的分项仍会在 compute_reward() 内计算，不影响训练，只是不再记录到 Episode/。
+        if "total_reward" not in stats.keys():
+            stats["total_reward"] = torch_zeros()
+        if "distance_reward" not in stats.keys():
+            stats["distance_reward"] = torch_zeros()
+        if "potential_shaping_reward" not in stats.keys():
             stats["potential_shaping_reward"] = torch_zeros()
-        if not "collision_reward" in stats.keys():
+        if "speed_reward" not in stats.keys():
+            stats["speed_reward"] = torch_zeros()
+        if "turn_hazard_penalty" not in stats.keys():
+            stats["turn_hazard_penalty"] = torch_zeros()
+        if "goal_reward" not in stats.keys():
+            stats["goal_reward"] = torch_zeros()
+        if "collision_reward" not in stats.keys():
             stats["collision_reward"] = torch_zeros()
+
+        # ---------------- Diagnostics / constraints (not directly in reward) ----------------
+        if "position_error" not in stats.keys():
+            stats["position_error"] = torch_zeros()
+        if "boundary_penalty" not in stats.keys():
+            stats["boundary_penalty"] = torch_zeros()
         return stats
 
 
@@ -351,19 +360,16 @@ class CaptureXYTask(Core):
         linear_speed = torch.norm(linear_vel, dim=-1)
         angular_vel = current_state["angular_velocity"]  # (N,)
         heading_error_threshold = 1.0  # 弧度 ≈ 57.3°
-        # 期望
-        target_speed = torch.where(
-            self.heading_error.abs() > heading_error_threshold,
-            0.2,  
-            0.8   
-        )
-        # 朝向
-        heading_alignment_factor = torch.exp(-(self.heading_error.abs() / 0.5) ** 2)  # 0.5 rad ≈ 28°
 
-        # 速度
-        speed_reward = torch.exp(-((linear_speed - target_speed) ** 2) / 0.1) \
-                    * heading_alignment_factor \
-                    * 0.05
+        # 速度奖励（方向性）：只奖励“朝目标推进”的速度分量，避免绕圈/侧滑也能刷分。
+        eps = 1e-6
+        goal_dir = self._position_error / (self.position_dist.unsqueeze(-1) + eps)
+        dot_dim = min(goal_dir.shape[-1], linear_vel.shape[-1])
+        v_toward = (linear_vel[..., :dot_dim] * goal_dir[..., :dot_dim]).sum(dim=-1)
+        v_toward_pos = torch.clamp(v_toward, min=0.0)
+        v_ref = 0.8
+        speed_reward = (1.0 - torch.exp(-v_toward_pos / v_ref)) * 0.05
+        self._speed_reward = speed_reward
 
         # 角速度
         target_angular = torch.where(
@@ -387,10 +393,10 @@ class CaptureXYTask(Core):
         bad_behavior_mask = is_safe_zone & is_low_speed & is_turning_hard & is_potential_worsening
         turn_hazard_penalty = bad_behavior_mask.float() * -5.0
 
+        self._turn_hazard_penalty = turn_hazard_penalty
 
-        self.a = speed_reward  # 原记录
 
-
+        self.a = speed_reward  # 原记录（legacy）
 
         # Compute collision penalty
         self.collision_penalty = torch.zeros(self._num_envs, device=self._device, dtype=torch.float)
@@ -410,6 +416,7 @@ class CaptureXYTask(Core):
         self.collision_reward=self.collision_penalty
         # Add reward for reaching the goal
         goal_reward = (self._goal_reached * self._task_parameters.goal_reward).float() * 5.0
+        self._goal_reward = goal_reward
 
         # Save position_dist for next calculation
         self.prev_position_dist = self.position_dist
@@ -426,6 +433,8 @@ class CaptureXYTask(Core):
                     + angular_reward
                     + turn_in_place_bonus
                 )
+
+        self._total_reward = total_reward
         
         self.episode_sums["distance"] += self.distance_reward
         self.episode_sums["alignment"] += self.alignment_reward
@@ -605,23 +614,29 @@ class CaptureXYTask(Core):
 
     def update_statistics(self, stats: dict) -> dict:
 
+        def _add_if_present(key: str, value: torch.Tensor) -> None:
+            if key in stats:
+                stats[key] += value
 
-        linear_vel = self.current_state["linear_velocity"]
-        linear_speed = torch.norm(linear_vel, dim=-1)
-        self.vec_reeor=linear_speed
+        # ---------------- Reward components (preferred) ----------------
+        if hasattr(self, "_total_reward"):
+            _add_if_present("total_reward", self._total_reward)
+        if hasattr(self, "distance_reward"):
+            _add_if_present("distance_reward", self.distance_reward)
+        if hasattr(self, "potential_shaping_reward"):
+            _add_if_present("potential_shaping_reward", self.potential_shaping_reward)
+        if hasattr(self, "_speed_reward"):
+            _add_if_present("speed_reward", self._speed_reward)
+        if hasattr(self, "_turn_hazard_penalty"):
+            _add_if_present("turn_hazard_penalty", self._turn_hazard_penalty)
+        if hasattr(self, "_goal_reward"):
+            _add_if_present("goal_reward", self._goal_reward)
+        if hasattr(self, "collision_reward"):
+            _add_if_present("collision_reward", self.collision_reward)
 
-        stats["velocity_error"] += self.vec_reeor
-        stats["velocity_reward"] +=  self.a
-
-
-
-        stats["distance_reward"] += self.distance_reward
-        stats["alignment_reward"] += self.alignment_reward
-        stats["position_error"] += self.position_dist
-        stats["boundary_penalty"] += self.boundary_penalty
-        stats["boundary_dist"] += self.boundary_dist
-        stats["potential_shaping_reward"] += self.potential_shaping_reward
-        stats["collision_reward"] += self.collision_reward
+        # ---------------- Diagnostics / constraints (not directly in reward) ----------------
+        _add_if_present("position_error", self.position_dist)
+        _add_if_present("boundary_penalty", self.boundary_penalty)
 
         return stats
 

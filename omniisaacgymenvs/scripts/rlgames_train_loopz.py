@@ -54,6 +54,7 @@ import torch
 import math
 import time
 import datetime
+from collections import deque
 
 
 # from rl_games.torch_runner import Runner
@@ -68,7 +69,8 @@ import torch
 @hydra.main(config_name="config", config_path="../cfg")
 def parse_hydra_configs(cfg: DictConfig):
     # 生成时间戳字符串：用于 wandb 运行名/日志区分
-    time_str = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    # Example: Mar04_20-46-23
+    time_str = datetime.datetime.now().strftime("%b%d_%H-%M-%S")
     headless = cfg.headless
     # 读取分布式/多卡训练的本地进程 rank（默认 0）；用于给每个进程分配不同 GPU
     rank = int(os.getenv("LOCAL_RANK", "0"))
@@ -145,9 +147,9 @@ def parse_hydra_configs(cfg: DictConfig):
     # 注意：omni.isaac.core 相关模块在 Kit 初始化前可能不可用。
     # 这里会在 VecEnvRLGames 创建之后再导入/调用 set_seed（与 rlgames_train.py 的顺序对齐）。
 
-    # Hydra/Omni 风格：统一实验输出目录
+    # Hydra/Omni 风格：统一实验输出目录（按时间戳隔离每次运行，避免覆盖）
     experiment_name = cfg.train.params.config.name
-    experiment_dir = os.path.join("runs", experiment_name)
+    experiment_dir = os.path.join("runs", experiment_name, time_str)
     ckpt_dir = os.path.join(experiment_dir, "nn")
     os.makedirs(ckpt_dir, exist_ok=True)
 
@@ -384,6 +386,25 @@ def parse_hydra_configs(cfg: DictConfig):
     except Exception:
         max_updates = 500000
 
+    # TODO:---------------- Episode-return monitors (align with rl_games train111 rewards/*) ----------------
+    # Keep these as pure monitoring state: do NOT affect PPO inputs.
+    # Window size mirrors rl_games "games_to_track"-style smoothing.
+    episode_window_size = 100
+    ep_ret_raw = np.zeros(env.num_envs, dtype=np.float64)
+    ep_ret_shaped = np.zeros(env.num_envs, dtype=np.float64)
+    ep_len = np.zeros(env.num_envs, dtype=np.int64)
+    window_ret_raw = deque(maxlen=episode_window_size)
+    window_ret_shaped = deque(maxlen=episode_window_size)
+    window_len = deque(maxlen=episode_window_size)
+    global_frame = 0
+    total_train_time = 0.0
+
+    # TODO:---------------- Checkpoint saving schedule (by env-steps) ----------------
+    # Save checkpoints when global_frame crosses this interval.
+    # This is decoupled from eval_every_n to keep saving stable.
+    save_every_env_steps = int(cfg['environment'].get('save_every_env_steps', 0) or 0)
+    next_ckpt_frame = save_every_env_steps if save_every_env_steps > 0 else None
+
     # TODO:---------------- Logging knobs (keep rollout output quiet) ----------------
     # 只打印最开始的 step trace（例如 1 => 只打印 step0；2 => step0~step1）
     trace_first_n_steps = 1
@@ -402,6 +423,10 @@ def parse_hydra_configs(cfg: DictConfig):
         if reset_every_update:
             t_reset0 = time.time()
             env.reset()
+            # Reset monitoring accumulators when we force-reset the env.
+            ep_ret_raw[:] = 0.0
+            ep_ret_shaped[:] = 0.0
+            ep_len[:] = 0
             t_reset1 = time.time()
             if (t_reset1 - t_reset0) > 5.0:
                 print(f"[loopz] env.reset() took {t_reset1 - t_reset0:.2f}s")
@@ -420,6 +445,9 @@ def parse_hydra_configs(cfg: DictConfig):
         # 2) 回退：旧版 runner_loop 的 get_reward_info() 拆解统计（适用于 raisim 示例）
         episode_infos = []
 
+        # How many episodes ended during this update (for diagnosing sparse dones).
+        done_episodes_in_update = 0
+
         # 动作饱和率统计：用于监测 Squashed Gaussian 下 tanh 是否过度饱和
         # 定义：|a| > sat_threshold * clipActions 的元素比例（跨 env 与动作维度取均值）
         sat_threshold = 0.95
@@ -432,16 +460,6 @@ def parse_hydra_configs(cfg: DictConfig):
             print("Visualizing and evaluating the current policy")
             # 保存当前策略的确定性图（JIT编译模型）
             # actor.save_deterministic_graph(saver.data_dir+"/policy_"+str(update)+'.pt', torch.rand(1, ob_dim).cpu())
-            # 检查是否需要保存完整检查点
-            if update %  (1 * cfg['environment']['eval_every_n']) == 0:
-                # 保存完整检查点，包括Actor、Critic和优化器状态
-                torch.save({
-                    'actor_architecture_state_dict': actor.architecture.state_dict(),
-                    'actor_distribution_state_dict': actor.distribution.state_dict(),
-                    'critic_architecture_state_dict': critic.architecture.state_dict(),
-                    'optimizer_state_dict': ppo.optimizer.state_dict(),
-                    'update': update,
-                }, os.path.join(ckpt_dir, f"full_{update}.pt"))
 
             # # 提取策略的所有参数到一个扁平数组中
             # parameters = np.zeros([0], dtype=np.float32)
@@ -455,6 +473,10 @@ def parse_hydra_configs(cfg: DictConfig):
             # loaded_graph = torch.jit.load(saver.data_dir+"/policy_"+str(update)+'.pt')
             # 重置环境
             env.reset()
+            # Reset monitoring accumulators when we force-reset the env.
+            ep_ret_raw[:] = 0.0
+            ep_ret_shaped[:] = 0.0
+            ep_len[:] = 0
             # 保存环境的观察数据缩放参数
             env.save_scaling(ckpt_dir, str(update))
 
@@ -499,11 +521,43 @@ def parse_hydra_configs(cfg: DictConfig):
             env_step_dt_sum += env_step_dt
             env_step_dt_max = max(env_step_dt_max, env_step_dt)
 
+            # TODO:--- Episode-return monitors (raw vs shaped) ---
+            # Capture raw (pre-scale) reward for rewards/* curves.
+            try:
+                if torch.is_tensor(reward):
+                    reward_raw_np = reward.detach().cpu().numpy().copy()
+                elif isinstance(reward, np.ndarray):
+                    reward_raw_np = reward.copy()
+                else:
+                    reward_raw_np = np.asarray(reward, dtype=np.float64)
+            except Exception:
+                reward_raw_np = np.asarray(reward, dtype=np.float64)
+
             # TODO(loopz-reward-scale): scale rewards before feeding PPO (matches rl_games reward_shaper).
             try:
                 reward = reward * reward_scale
             except Exception:
                 pass
+
+            # TODO:Shaped/scaled reward for shaped_rewards/* curves.
+            try:
+                if torch.is_tensor(reward):
+                    reward_shaped_np = reward.detach().cpu().numpy()
+                else:
+                    reward_shaped_np = np.asarray(reward, dtype=np.float64)
+            except Exception:
+                reward_shaped_np = np.asarray(reward, dtype=np.float64)
+
+            # Update per-env accumulators.
+            try:
+                ep_ret_raw += reward_raw_np
+            except Exception:
+                ep_ret_raw += np.asarray(reward_raw_np, dtype=np.float64)
+            try:
+                ep_ret_shaped += reward_shaped_np
+            except Exception:
+                ep_ret_shaped += np.asarray(reward_shaped_np, dtype=np.float64)
+            ep_len += 1
 
             try:
                 if torch.is_tensor(dones):
@@ -518,6 +572,32 @@ def parse_hydra_configs(cfg: DictConfig):
                     done_frac = float(np.mean(dones))
                 except Exception:
                     done_frac = float('nan')
+
+            # Finalize episodes on done, push into sliding windows, then reset per-env accumulators.
+            try:
+                if torch.is_tensor(dones):
+                    done_mask = dones.detach().cpu().numpy().astype(bool)
+                else:
+                    done_mask = np.asarray(dones).astype(bool)
+            except Exception:
+                done_mask = np.asarray(dones).astype(bool)
+
+            if np.any(done_mask):
+                done_ids = np.nonzero(done_mask)[0]
+                done_episodes_in_update += int(done_ids.size)
+                try:
+                    window_ret_raw.extend(ep_ret_raw[done_ids].tolist())
+                    window_ret_shaped.extend(ep_ret_shaped[done_ids].tolist())
+                    window_len.extend(ep_len[done_ids].tolist())
+                except Exception:
+                    for _eid in done_ids.tolist():
+                        window_ret_raw.append(float(ep_ret_raw[_eid]))
+                        window_ret_shaped.append(float(ep_ret_shaped[_eid]))
+                        window_len.append(int(ep_len[_eid]))
+
+                ep_ret_raw[done_ids] = 0.0
+                ep_ret_shaped[done_ids] = 0.0
+                ep_len[done_ids] = 0
 
             if step == 0:
                 try:
@@ -592,6 +672,23 @@ def parse_hydra_configs(cfg: DictConfig):
 
         # 记录循环结束时间
         end = time.time()
+        total_train_time += float(end - start)
+        global_frame += int(total_steps)
+
+        # Checkpoint saving (by env-steps): save once when crossing threshold.
+        if next_ckpt_frame is not None and global_frame >= int(next_ckpt_frame):
+            ckpt_name = f"full_u{update}_f{global_frame}.pt"
+            torch.save({
+                'actor_architecture_state_dict': actor.architecture.state_dict(),
+                'actor_distribution_state_dict': actor.distribution.state_dict(),
+                'critic_architecture_state_dict': critic.architecture.state_dict(),
+                'optimizer_state_dict': ppo.optimizer.state_dict(),
+                'update': update,
+            }, os.path.join(ckpt_dir, ckpt_name))
+
+            # Advance threshold (avoid repeated saves within same update).
+            if save_every_env_steps > 0:
+                next_ckpt_frame = ((global_frame // save_every_env_steps) + 1) * save_every_env_steps
 
         # 训练统计：优先使用 extras["episode"]（USV/Omni 推荐），否则回退到 reward_info 统计
         if len(episode_infos) > 0:
@@ -636,6 +733,30 @@ def parse_hydra_configs(cfg: DictConfig):
             ppo.writer.add_scalar('Episode/avg_reward_scaled', avg_reward_scaled, update)
             ppo.writer.add_scalar('Episode/avg_reward_raw', avg_reward_raw, update)
             # ppo.writer.add_scalar('Episode/average_ll_performance', float(average_ll_performance), update)
+        except Exception:
+            pass
+
+        # TensorBoard: rl_games(train111) style rewards/* (episode return mean over last N episodes)
+        try:
+            if len(window_ret_raw) > 0:
+                mean_ep_ret_raw = float(np.mean(np.asarray(window_ret_raw, dtype=np.float64)))
+                mean_ep_ret_shaped = float(np.mean(np.asarray(window_ret_shaped, dtype=np.float64)))
+                mean_ep_len = float(np.mean(np.asarray(window_len, dtype=np.float64)))
+
+                ppo.writer.add_scalar('rewards/iter', mean_ep_ret_raw, update)
+                ppo.writer.add_scalar('rewards/step', mean_ep_ret_raw, global_frame)
+                ppo.writer.add_scalar('rewards/time', mean_ep_ret_raw, total_train_time)
+
+                ppo.writer.add_scalar('shaped_rewards/iter', mean_ep_ret_shaped, update)
+                ppo.writer.add_scalar('shaped_rewards/step', mean_ep_ret_shaped, global_frame)
+                ppo.writer.add_scalar('shaped_rewards/time', mean_ep_ret_shaped, total_train_time)
+
+                ppo.writer.add_scalar('episode_lengths/iter', mean_ep_len, update)
+                ppo.writer.add_scalar('episode_lengths/step', mean_ep_len, global_frame)
+                ppo.writer.add_scalar('episode_lengths/time', mean_ep_len, total_train_time)
+
+            ppo.writer.add_scalar('Diagnostics/done_episodes_in_update', float(done_episodes_in_update), update)
+            ppo.writer.add_scalar('Diagnostics/episode_window_size', float(len(window_ret_raw)), update)
         except Exception:
             pass
 

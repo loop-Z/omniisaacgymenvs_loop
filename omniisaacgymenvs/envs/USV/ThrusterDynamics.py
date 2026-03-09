@@ -181,12 +181,14 @@ class DynamicsFirstOrder(Dynamics):
         # Debug: print(cmd_value)
         # print(f"cmd_value: {cmd_value}")
         # cmd_value is size (num_envs,2)
-        idx_left = torch.round(((cmd_value[:, 0] + 1) / 2 * self.n_left) - 1).to(
-            torch.long
-        )
-        idx_right = torch.round(((cmd_value[:, 1] + 1) / 2 * self.n_right) - 1).to(
-            torch.long
-        )
+        # Map command range [-1, 1] -> index range [0, n-1].
+        # NOTE: The previous formula produced idx=-1 when cmd=-1, which in PyTorch
+        # indexes the last element and can yield a large positive force unexpectedly.
+        idx_left = torch.round(((cmd_value[:, 0] + 1) / 2) * (self.n_left - 1)).to(torch.long)
+        idx_right = torch.round(((cmd_value[:, 1] + 1) / 2) * (self.n_right - 1)).to(torch.long)
+
+        idx_left = torch.clamp(idx_left, 0, self.n_left - 1)
+        idx_right = torch.clamp(idx_right, 0, self.n_right - 1)
         # print(f"idx_left: {idx_left}")
         # Using indices to gather interpolated forces for each thruster
         self.thruster_forces_before_dynamics[:, 0] = self.y_linear_interp_left[idx_left]

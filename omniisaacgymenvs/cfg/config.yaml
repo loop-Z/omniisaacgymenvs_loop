@@ -58,7 +58,7 @@ recording_fps: 30
 # directory to save recordings in
 recording_dir: ''
 
-wandb_activate: False
+wandb_activate: True
 wandb_group: 'loopzhang7-zhejiang-university'
 #wandb_name: ${train.params.config.name}
 wandb_name: '729'

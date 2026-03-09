@@ -19,6 +19,9 @@ Our framework includes a highly parallelized environment with domain randomizati
 2. **Test**
   PYTHON_PATH scripts/rlgames_train.py task=USV/IROS2024/USV_Virtual_CaptureXY_SysID-TEST train=USV/USV_PPOcontinuous_MLP test=True checkpoint=runs/Capture-TEST/nn/Capture-TEST.pth num_envs=32
 
+3. **Loopz Play (loopz .pt checkpoints)**
+  PYTHON_PATH scripts/rlgames_play_loopz.py task=USV/IROS2024/USV_Virtual_CaptureXY_SysID-TEST train=USV/USV_MLP test=True checkpoint=runs/<EXP>/<RUN_ID>/nn/full_u<UPDATE>_f<GLOBAL_FRAME>.pt num_envs=1 headless=False
+
 
 ## Task Description - Capture + @
 
@@ -128,21 +131,33 @@ If you want to activate water visualization, you can activate it in the config .
 <details>
 <summary><span style="font-size: 1.3em; font-weight: bold;">Loading trained models (or checkpoints)</span></summary>
 
-Checkpoints are saved in the folder `runs/EXPERIMENT_NAME/nn` where `EXPERIMENT_NAME` 
-defaults to the task name but can also be overridden via the `experiment` argument.
+We provide two checkpoint formats/scripts:
 
-To load a trained checkpoint and continue training, use the `checkpoint` argument:
+- **rl-games scripts (`scripts/rlgames_train.py`, `.pth`)**
+  - Checkpoints are saved in `runs/EXPERIMENT_NAME/nn` where `EXPERIMENT_NAME` defaults to the task name but can also be overridden via the `experiment` argument.
+
+- **loopz scripts (`scripts/rlgames_train_loopz.py` / `scripts/rlgames_play_loopz.py`, `.pt`)**
+  - Checkpoints are saved in `runs/EXPERIMENT_NAME/RUN_ID/nn` where `RUN_ID` is an auto-generated timestamp folder (e.g. `Mar05_21-13-40`).
+  - Full checkpoints follow the naming pattern: `full_u<UPDATE>_f<GLOBAL_FRAME>.pt`.
+
+To load a trained checkpoint and continue training (rl-games), use the `checkpoint` argument:
 
 ```bash
 PYTHON_PATH scripts/rlgames_train.py task=USV/IROS2024/USV_Virtual_CaptureXY_SysID-TEST train=USV/USV_PPOcontinuous_MLP checkpoint=runs/Capture-TEST/nn/Capture-TEST.pth
 ```
 
-To load a trained checkpoint and only perform inference (no training), pass `test=True` 
+To load a trained checkpoint and only perform inference (no training) (rl-games), pass `test=True` 
 as an argument, along with the checkpoint name. To avoid rendering overhead, you may 
 also want to run with fewer environments using `num_envs=64`:
 
 ```bash
-PYTHON_PATH sscripts/rlgames_train.py task=USV/IROS2024/USV_Virtual_CaptureXY_SysID-TEST train=USV/USV_PPOcontinuous_MLP checkpoint=runs/Capture-TEST/nn/Capture-TEST.pth test=True num_envs=64
+PYTHON_PATH scripts/rlgames_train.py task=USV/IROS2024/USV_Virtual_CaptureXY_SysID-TEST train=USV/USV_PPOcontinuous_MLP checkpoint=runs/Capture-TEST/nn/Capture-TEST.pth test=True num_envs=64
+```
+
+To run deterministic inference/visualization using a loopz `.pt` checkpoint, use:
+
+```bash
+PYTHON_PATH scripts/rlgames_play_loopz.py task=USV/IROS2024/USV_Virtual_CaptureXY_SysID-TEST train=USV/USV_MLP test=True checkpoint=runs/<EXP>/<RUN_ID>/nn/full_u<UPDATE>_f<GLOBAL_FRAME>.pt num_envs=1 headless=False
 ```
 
 Note that if there are special characters such as `[` or `=` in the checkpoint names, 
@@ -228,7 +243,7 @@ In some places in the config, you will find other variables referenced (for exam
 
 Tensorboard can be launched during training via the following command:
 ```bash
-PYTHON_PATH -m tensorboard.main --logdir runs/EXPERIMENT_NAME/summaries
+PYTHON_PATH -m tensorboard.main --logdir runs/EXPERIMENT_NAME
 ```
 
 ## WandB support

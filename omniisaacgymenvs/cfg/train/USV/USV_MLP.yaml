@@ -12,6 +12,6 @@ params:
     gamma: 0.99
     tau: 0.95
     learning_rate: 1e-4
-    horizon_length: 16
-    minibatch_size: 8192
+    horizon_length: 32  #16TODO:
+    minibatch_size: 16384 #TODO:8192
     mini_epochs: 8

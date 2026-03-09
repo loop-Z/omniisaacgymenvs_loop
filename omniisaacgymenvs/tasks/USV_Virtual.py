@@ -118,6 +118,17 @@ class USVVirtual(RLTask):
         self.step = 0
         self.split_thrust = self._task_cfg["env"]["split_thrust"]
 
+        action_proc_cfg = self._task_cfg["env"].get("action_processing", {})
+        self._use_affine_thrust_mapping = bool(
+            action_proc_cfg.get("use_affine_thrust_mapping", True)
+        )
+        self._initial_action_bias = float(action_proc_cfg.get("initial_action_bias", 0.0))
+        self._initial_action_bias_steps = int(
+            action_proc_cfg.get("initial_action_bias_steps", 0)
+        )
+        self._action_bias_step_count = 0
+        self._penalties_use_thrust_u = bool(action_proc_cfg.get("penalties_use_thrust_u", True))
+
         self.UF = ForceDisturbance(
             self._task_cfg["env"]["disturbances"]["forces"],
             self._num_envs,
@@ -219,7 +230,18 @@ class USVVirtual(RLTask):
         self.extras = {}
         self.episode_sums = self.task.create_stats({})
         self.add_stats(self._penalties.get_stats_name())
-        self.add_stats(["normed_linear_vel", "normed_angular_vel", "actions_sum"])
+        self.add_stats(
+            [
+                "normed_linear_vel",
+                "normed_angular_vel",
+                # Action/force sign diagnostics (episode-averaged in extras['episode']).
+                "cmd_neg_rate",
+                # Mapped no-reverse thrust diagnostics.
+                "u_mean",
+                "u_low_rate",
+                "u_sum",
+            ]
+        )
         self.root_pos = torch.zeros(
             (self._num_envs, 3), device=self._device, dtype=torch.float32
         )
@@ -246,6 +268,20 @@ class USVVirtual(RLTask):
         )
         self.thrusters = torch.zeros(
             (self._num_envs, 6), device=self._device, dtype=torch.float32
+        )
+
+        # Diagnostics: thruster commands right before the LUT mapping.
+        # Stored *before* enforcing no-reverse (after noise + clamp to [-1, 1]).
+        self.thrust_cmds_before_rect = torch.zeros(
+            (self._num_envs, self._max_actions),
+            device=self._device,
+            dtype=torch.float32,
+        )
+        # Commands actually sent to thrusters, in [0, 1] (no-reverse).
+        self.thrust_cmds_unit = torch.zeros(
+            (self._num_envs, self._max_actions),
+            device=self._device,
+            dtype=torch.float32,
         )
         self.stop = torch.tensor([0.0, 0.0], device=self._device)
         self.turn_right = torch.tensor([1.0, -1.0], device=self._device)
@@ -478,13 +514,36 @@ class USVVirtual(RLTask):
         
         thrusts = thrust_cmds
 
+        # Early-training fixed bias: u0=0.2 -> a0=-0.6.
+        if (
+            self._initial_action_bias_steps > 0
+            and self._action_bias_step_count < self._initial_action_bias_steps
+        ):
+            thrusts = thrusts + self._initial_action_bias
+
+        self._action_bias_step_count += 1
+
         thrusts = self.AN.add_noise_on_act(thrusts)
 
+        # Clamp to valid policy command range.
         thrusts = torch.clamp(thrusts, -1.0, 1.0)
 
-        thrusts[reset_env_ids] = 0
+        # Store the command before mapping to no-reverse thrust.
+        self.thrust_cmds_before_rect[:, :] = thrusts
 
-        self.thrusters_dynamics.set_target_force(thrusts)
+        # Map to no-reverse thrust commands u in [0, 1].
+        if self._use_affine_thrust_mapping:
+            u = 0.5 * (thrusts + 1.0)
+        else:
+            # Legacy behavior: hard-rectify negatives.
+            u = torch.clamp(thrusts, 0.0, 1.0)
+
+        u = torch.clamp(u, 0.0, 1.0)
+        self.thrust_cmds_unit[:, :] = u
+
+        u[reset_env_ids] = 0
+
+        self.thrusters_dynamics.set_target_force(u)
         
         return
 
@@ -573,13 +632,39 @@ class USVVirtual(RLTask):
 
 
     def update_state_statistics(self) -> None:
-        self.episode_sums["normed_linear_vel"] += torch.norm(
-            self.current_state["linear_velocity"], dim=-1
-        )
-        self.episode_sums["normed_angular_vel"] += torch.abs(
-            self.current_state["angular_velocity"]
-        )
-        self.episode_sums["actions_sum"] += torch.sum(self.actions, dim=-1)
+        if "normed_linear_vel" in self.episode_sums:
+            self.episode_sums["normed_linear_vel"] += torch.norm(
+                self.current_state["linear_velocity"], dim=-1
+            )
+        if "normed_angular_vel" in self.episode_sums:
+            self.episode_sums["normed_angular_vel"] += torch.abs(
+                self.current_state["angular_velocity"]
+            )
+        if "actions_sum" in self.episode_sums:
+            self.episode_sums["actions_sum"] += torch.sum(self.actions, dim=-1)
+
+        # Thruster sign diagnostics:
+        # - cmd_neg_rate: whether the policy still *tries* to command reverse thrust
+        # - thruster_force_neg_rate: whether reverse thrust is physically applied
+        cmd = self.thrust_cmds_before_rect
+        forces = self.thrusters[:, [0, 3]]
+
+        neg_cmd = cmd < 0.0
+        neg_force = forces < 0.0
+
+        # Rates are averaged over the two thrusters per env, then summed over steps.
+        if "cmd_neg_rate" in self.episode_sums:
+            self.episode_sums["cmd_neg_rate"] += neg_cmd.float().mean(dim=1)
+        if "thruster_force_neg_rate" in self.episode_sums:
+            self.episode_sums["thruster_force_neg_rate"] += neg_force.float().mean(dim=1)
+
+        u = self.thrust_cmds_unit
+        if "u_mean" in self.episode_sums:
+            self.episode_sums["u_mean"] += u.mean(dim=1)
+        if "u_low_rate" in self.episode_sums:
+            self.episode_sums["u_low_rate"] += (u < 0.05).float().mean(dim=1)
+        if "u_sum" in self.episode_sums:
+            self.episode_sums["u_sum"] += u.sum(dim=1)
 
 
     def is_done(self) -> None:
@@ -766,8 +851,11 @@ class USVVirtual(RLTask):
         """
         overall_reward = self.task.compute_reward(self.current_state, self.actions)
         self.step += 1 / self._task_cfg["env"]["horizon_length"]
+        penalty_actions = (
+            self.thrust_cmds_unit if self._penalties_use_thrust_u else self.actions
+        )
         penalties = self._penalties.compute_penalty(
-            self.current_state, self.actions, self.step
+            self.current_state, penalty_actions, self.step
         )
 
         # TODO:(loopz-nan-probe) validate reward components before they get propagated/logged.
