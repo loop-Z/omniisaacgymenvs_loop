@@ -1,21 +1,15 @@
-__pycache___
+# 忽略 WandB 日志
+wandb/
+.wandb_tb_rewrite_state.*
+
+# 忽略 Python 缓存
 __pycache__/
-runs
-models
-rl_games/
-omniisaacgymenvs.egg-info/
-checkpoints
-omniisaacgymenvs/wandb
-evaluations
-ros_lab_exp
-lab_tests
-*.mp4
-*.npy
-*.csv
-*.zip
-*.ipynb
-!eval_multi_models.ipynb
-!icra24_results.ipynb
-!icra24_RT_plots.ipynb
-*.etli
-*.bag
+*.py[cod]
+
+# 忽略训练生成的模型和日志
+runs/
+summaries/
+*.tfevents.*
+
+# 忽略系统文件
+.DS_Store
