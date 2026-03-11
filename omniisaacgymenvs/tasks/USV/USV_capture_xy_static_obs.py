@@ -52,6 +52,14 @@ class CaptureXYTask(Core):
         self._goal_reached = torch.zeros(
             (self._num_envs), device=self._device, dtype=torch.int32
         )
+        # Episode outcomes cached on termination step (read by env reset).
+        # Safety-first: collision overrides success.
+        self._done_success = torch.zeros(
+            (self._num_envs), device=self._device, dtype=torch.int32
+        )
+        self._done_collision = torch.zeros(
+            (self._num_envs), device=self._device, dtype=torch.int32
+        )
         self._target_positions = torch.zeros(
             (self._num_envs, 2), device=self._device, dtype=torch.float32
         )
@@ -150,6 +158,12 @@ class CaptureXYTask(Core):
             stats["goal_reward"] = torch_zeros()
         if "collision_reward" not in stats.keys():
             stats["collision_reward"] = torch_zeros()
+
+        # ---------------- Episode outcome events (0/1 per episode) ----------------
+        if "success" not in stats.keys():
+            stats["success"] = torch_zeros()
+        if "collision" not in stats.keys():
+            stats["collision"] = torch_zeros()
 
         # ---------------- Diagnostics / constraints (not directly in reward) ----------------
         if "position_error" not in stats.keys():
@@ -396,10 +410,6 @@ class CaptureXYTask(Core):
         
         
         
-        
-        
-        
-        
         self.prev_potential = current_potential.clone()
 
 
@@ -508,28 +518,32 @@ class CaptureXYTask(Core):
         kill_dist = self._task_parameters.kill_dist
 
         # Check for distance-based termination
-        die = torch.where(self.position_dist > kill_dist, ones, die)
-        
-        
-    # Check for collision-based termination
-        #print("self._blue_pin_positionsself._blue_pin_positions", self._blue_pin_positions[0, :, :2].cpu().numpy())
-        for i in range(self.big):
-            obstacle_dist = torch.norm(self.xunlian_pos[:, i, :2] - current_state["position"], dim=1)
-            #print("判断回合done距离", obstacle_dist)
-            die = torch.where(obstacle_dist < self.collision_threshold, ones, die)
-            # if torch.any(torch.where(obstacle_dist < self.collision_threshold, ones, die) == 1):
-            #     print("colllllllllllllllllllllllllll")
+        distance_kill = self.position_dist > kill_dist
 
-
-            #print("current_state",current_state["position"])
-
+        # Check for collision-based termination (vectorized)
+        obstacle_rel = (
+            self.xunlian_pos[:, : self.big, :2]
+            - current_state["position"].unsqueeze(1)
+        )
+        obstacle_dist = torch.norm(obstacle_rel, dim=-1)
+        min_obstacle_dist = obstacle_dist.min(dim=1).values
+        collision_kill = min_obstacle_dist < self.collision_threshold
 
         # Check for goal-based termination
-        die = torch.where(
-            self._goal_reached >= self._task_parameters.kill_after_n_steps_in_tolerance,
-            ones,
-            die,
+        success_kill = (
+            self._goal_reached
+            >= self._task_parameters.kill_after_n_steps_in_tolerance
         )
+
+        die = torch.where(distance_kill | collision_kill | success_kill, ones, die)
+
+        # Cache episode outcomes for env reset logging.
+        terminated = die.to(dtype=torch.bool)
+        if terminated.any().item():
+            self._done_collision[terminated] = collision_kill[terminated].to(dtype=torch.int32)
+            self._done_success[terminated] = (
+                (success_kill & ~collision_kill)[terminated].to(dtype=torch.int32)
+            )
 
         # if torch.any(torch.where(
         #     self._goal_reached >= self._task_parameters.kill_after_n_steps_in_tolerance,
@@ -543,6 +557,13 @@ class CaptureXYTask(Core):
         #     print("kill_dist kill_dist kill_dist kill_dist)")
 
         return die
+
+    def get_episode_outcomes(self, env_ids: torch.Tensor) -> dict:
+        env_ids_long = env_ids.long()
+        return {
+            "success": self._done_success[env_ids_long].clone().to(dtype=torch.float32),
+            "collision": self._done_collision[env_ids_long].clone().to(dtype=torch.float32),
+        }
 
 
 
@@ -587,6 +608,8 @@ class CaptureXYTask(Core):
     def reset(self, env_ids: torch.Tensor) -> None:
         self._goal_reached[env_ids] = 0
         #print("self._goal_reached",self._goal_reached)
+        self._done_success[env_ids] = 0
+        self._done_collision[env_ids] = 0
         self.just_had_been_reset = env_ids.clone()
         self.prev_potential = None
         self._blue_pin_positions[env_ids, :, :] = 0.0

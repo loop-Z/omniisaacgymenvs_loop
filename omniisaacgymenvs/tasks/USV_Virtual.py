@@ -230,6 +230,8 @@ class USVVirtual(RLTask):
         self.extras = {}
         self.episode_sums = self.task.create_stats({})
         self.add_stats(self._penalties.get_stats_name())
+        # Episode outcome events (0/1 per episode).
+        self.add_stats(["success", "collision"])
         self.add_stats(
             [
                 "normed_linear_vel",
@@ -773,6 +775,14 @@ class USVVirtual(RLTask):
         Resets the environments with the given indices.
         """
         num_resets = len(env_ids)
+        # Read episode outcomes BEFORE task.reset() clears per-episode buffers.
+        if hasattr(self.task, "get_episode_outcomes"):
+            episode_outcomes = self.task.get_episode_outcomes(env_ids)
+        else:
+            episode_outcomes = {
+                "success": torch.zeros(num_resets, device=self._device),
+                "collision": torch.zeros(num_resets, device=self._device),
+            }
         # Resets the counter of steps for which the goal was reached
         self.task.reset(env_ids)
         self.UF.generate_force(env_ids, num_resets)
@@ -815,12 +825,26 @@ class USVVirtual(RLTask):
         # Bookkeeping
         self.reset_buf[env_ids] = 0
         self.progress_buf[env_ids] = 0
+
+        # Inject per-episode outcome events into episode_sums so they get logged.
+        if "success" in self.episode_sums:
+            self.episode_sums["success"][env_ids] = episode_outcomes["success"].to(
+                dtype=self.episode_sums["success"].dtype
+            )
+        if "collision" in self.episode_sums:
+            self.episode_sums["collision"][env_ids] = episode_outcomes["collision"].to(
+                dtype=self.episode_sums["collision"].dtype
+            )
+
         # Fill `extras`
         self.extras["episode"] = {}
         for key in self.episode_sums.keys():
-            self.extras["episode"][key] = (
-                torch.mean(self.episode_sums[key][env_ids]) / self._max_episode_length
-            )
+            if key in ("success", "collision"):
+                self.extras["episode"][key] = torch.mean(self.episode_sums[key][env_ids])
+            else:
+                self.extras["episode"][key] = (
+                    torch.mean(self.episode_sums[key][env_ids]) / self._max_episode_length
+                )
 
             # TODO:(loopz-nan-probe) report which episode key goes NaN before it is zeroed.
             if self._nan_probe_enabled() and torch.isnan(self.extras["episode"][key]).any():
