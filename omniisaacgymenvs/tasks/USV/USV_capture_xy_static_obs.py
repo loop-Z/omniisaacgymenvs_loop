@@ -170,6 +170,16 @@ class CaptureXYTask(Core):
             stats["position_error"] = torch_zeros()
         if "boundary_penalty" not in stats.keys():
             stats["boundary_penalty"] = torch_zeros()
+
+        # ---------------- Reward shaping diagnostics (normalized by maxEpisodeLength) ----------------
+        if "danger_mean" not in stats.keys():
+            stats["danger_mean"] = torch_zeros()
+        if "danger_hi_rate" not in stats.keys():
+            stats["danger_hi_rate"] = torch_zeros()
+        if "g_gate_mean" not in stats.keys():
+            stats["g_gate_mean"] = torch_zeros()
+        if "g_safe_mean" not in stats.keys():
+            stats["g_safe_mean"] = torch_zeros()
         return stats
 
 
@@ -345,12 +355,55 @@ class CaptureXYTask(Core):
         )
         reset_mask = self.just_had_been_reset.clone()
         self.distance_reward[reset_mask] = 0
+        
+        # TODO: Temporary fix
+        # Align cross-episode distance history to avoid fake progress on the first step after reset.
+        # (A3 gating uses delta_d = prev_position_dist - position_dist.)
+        if self.prev_position_dist is not None and len(reset_mask) > 0:
+            self.prev_position_dist[reset_mask] = self.position_dist[reset_mask]
 
         # 【新增】 3. 势能场引导奖励 (Potential Field Shaping Reward)
         current_potential = self._get_potential_values(current_state["position"])
-        danger_factor = torch.clamp(current_potential * 5.0, 0.0, 1.0)
-        self.alignment_reward *= (1.0 - danger_factor)
-        self.distance_reward *= (1.0 - danger_factor * 0.5)
+        
+        # 原方案
+        # danger_factor = torch.clamp(current_potential * 5.0, 0.0, 1.0)
+        
+        # B3 (thresholded danger_factor): smoothstep dual-threshold.
+        # Intuition: low/medium potential -> almost no suppression; very high potential -> strong suppression.
+        pot_norm = torch.clamp(current_potential, 0.0, 1.0)
+        p_start = 0.6 
+        p_full = 0.9
+        x = torch.clamp((pot_norm - p_start) / (p_full - p_start + 1e-6), 0.0, 1.0)
+        danger_factor = x * x * (3.0 - 2.0 * x)
+
+        #TODO:
+        # Cache per-step danger metrics for episode logging (USV_Virtual will divide by maxEpisodeLength).
+        self._danger_factor = danger_factor
+        danger_hi_th = 0.5
+        self._danger_hi = (danger_factor > danger_hi_th).to(dtype=danger_factor.dtype)
+
+        # g_safe-1: safety-progress channel (danger decreasing)
+        # Track per-env previous danger_factor; align on reset to avoid cross-episode deltas.
+        if not hasattr(self, 'prev_danger_factor') or self.prev_danger_factor is None:
+            self.prev_danger_factor = danger_factor.clone()
+        if len(reset_mask) > 0:
+            self.prev_danger_factor[reset_mask] = danger_factor[reset_mask]
+        
+        
+        # 原方案
+        # self.alignment_reward *= (1.0 - danger_factor)
+        # self.distance_reward *= (1.0 - danger_factor * 0.5)
+        
+        # B1 (minimal, recommended): keep navigation signals alive in high-danger zones.
+        # Danger can weaken "go straight" incentives, but should not fully disable guidance.
+        min_align = 0.3  # suggested range: 0.2~0.4
+        min_dist = 0.6   # suggested range: 0.4~0.7
+
+        align_mul = torch.maximum(torch.as_tensor(min_align, device=self._device), 1.0 - danger_factor)
+        dist_mul = torch.maximum(torch.as_tensor(min_dist, device=self._device), 1.0 - danger_factor * 0.5)
+
+        self.alignment_reward *= align_mul
+        self.distance_reward *= dist_mul
 
         # ---------------- B2: Distance progress + heading gate (G1, alpha_gate=90deg) ----------------
         # Gate: g = max(0, cos(|heading_error|)). When heading error > 90deg, g=0.
@@ -380,9 +433,79 @@ class CaptureXYTask(Core):
         # 如果环境刚重置，上一帧势能应该等于当前势能（奖励为0），避免跨回合计算差值
         if len(reset_mask) > 0:
             self.prev_potential[reset_mask] = current_potential[reset_mask]
-        potential_scale = 100.0 # 调节系数，控制引导力度
-        self.potential_shaping_reward = (self.prev_potential - current_potential) * potential_scale
-        # print("self.potential_shaping_reward:",self.potential_shaping_reward)
+
+        # 原始势能方案
+        # potential_scale = 100.0 # 调节系数，控制引导力度
+        # self.potential_shaping_reward = (self.prev_potential - current_potential) * potential_scale
+        
+        # Potential shaping reward (A1 + A3)——势能引导奖励
+        # A1: deadzone + smooth saturation (tanh)
+        # A3: gate ONLY positive shaping by true progress (v_toward / delta distance) and heading.
+        potential_scale = 100.0  # base scale for (prev - current)
+        potential_raw = (self.prev_potential - current_potential) * potential_scale
+
+        # A1 parameters (user-chosen)
+        r_dead = 0.01
+        r_max = 2.0
+
+        potential_raw = torch.where(potential_raw.abs() < r_dead, torch.zeros_like(potential_raw), potential_raw)
+        potential_a1 = r_max * torch.tanh(potential_raw / (r_max + 1e-6))
+
+        # A3 gate construction
+        # v_toward: velocity component toward the goal direction
+        goal_dir_for_gate = self._position_error / (self.position_dist.unsqueeze(-1) + 1e-6)
+        v_toward_for_gate = torch.sum(current_state["linear_velocity"] * goal_dir_for_gate, dim=-1)
+        v_toward_pos_for_gate = torch.clamp(v_toward_for_gate, min=0.0)
+
+        # delta distance: positive if moving closer
+        delta_d = self.prev_position_dist - self.position_dist
+        delta_d_pos = torch.clamp(delta_d, min=0.0)
+
+        v0, v1 = 0.02, 0.15
+        d1 = 0.01
+        g_v = torch.clamp((v_toward_pos_for_gate - v0) / (v1 - v0 + 1e-6), 0.0, 1.0)
+        g_d = torch.clamp(delta_d_pos / (d1 + 1e-6), 0.0, 1.0)
+        # 原方案
+        # g_progress = torch.maximum(g_v, g_d)
+        
+        # g_safe: positive when the agent moves into a safer region (danger_factor decreases).
+        # This helps gap-entry maneuvers where goal-progress is temporarily weak but safety improves.
+        delta_safe = self.prev_danger_factor - danger_factor
+        delta_safe_pos = torch.clamp(delta_safe, min=0.0)
+        s1 = 0.02
+        g_safe = torch.clamp(delta_safe_pos / (s1 + 1e-6), 0.0, 1.0)
+
+        # Cache per-step safety-progress gate for episode logging.
+        self._g_safe = g_safe
+
+        g_progress = torch.maximum(torch.maximum(g_v, g_d), g_safe)
+
+        # S2-b: heading gate
+        # heading gate (reuse g computed above: g = clamp(cos(heading_error), 0, 1))
+        heading_gate_pow = 1.0
+        g_gate = g_progress * torch.pow(g, heading_gate_pow)
+
+        # Gate only positive shaping; keep negative shaping as-is.
+        pot_pos = torch.clamp(potential_a1, min=0.0)
+        pot_neg = torch.clamp(potential_a1, max=0.0)
+
+        # 原方案
+        # self.potential_shaping_reward = g_gate * pot_pos + pot_neg
+        
+        # S2-a: only gate "large" positive shaping; let small positive shaping pass through.
+        # Note: pot_pos is AFTER A1 (deadzone + tanh), so pot_pos in [0, r_max].
+        r_gate0 = 0.5
+        gate_pos = torch.where(pot_pos < r_gate0, torch.ones_like(g_gate), g_gate)
+        self.potential_shaping_reward = gate_pos * pot_pos + pot_neg
+
+        # Cache effective shaping gate (after S2-a pass-through) for episode logging.
+        self._g_gate = gate_pos
+
+        # Update safety history for next step.
+        self.prev_danger_factor = danger_factor.clone()
+        
+
+        # print("self.potential_shaping_reward:", self.potential_shaping_reward)
         
         # 5. 【关键策略】惩罚“死亡转向”（B2 细化）
         # 如果势能正在增加 (shaping < -pot_eps) 且船在转向，则惩罚。
@@ -598,6 +721,16 @@ class CaptureXYTask(Core):
             _add_if_present("goal_reward", self._goal_reward)
         if hasattr(self, "collision_reward"):
             _add_if_present("collision_reward", self.collision_reward)
+
+        # ---------------- Reward shaping diagnostics (normalized by maxEpisodeLength) ----------------
+        if hasattr(self, "_danger_factor"):
+            _add_if_present("danger_mean", self._danger_factor)
+        if hasattr(self, "_danger_hi"):
+            _add_if_present("danger_hi_rate", self._danger_hi)
+        if hasattr(self, "_g_gate"):
+            _add_if_present("g_gate_mean", self._g_gate)
+        if hasattr(self, "_g_safe"):
+            _add_if_present("g_safe_mean", self._g_safe)
 
         # ---------------- Diagnostics / constraints (not directly in reward) ----------------
         _add_if_present("position_error", self.position_dist)
