@@ -26,7 +26,7 @@ class Core:
         self._device = device
         self.n_closest_obs = 5
         # Observation buffer
-        self._num_observations = 8 + self.n_closest_obs * 3 + 4 # Updated to match CaptureXYTask (2 + 1 + 5 + 24)
+        self._num_observations = 8 + self.n_closest_obs * 3 + 4 # Updated to match CaptureXYTask (2 + 1 + 5 + 15 + 4)
         self._obs_buffer = torch.zeros(
             (self._num_envs, self._num_observations), device=self._device, dtype=torch.float32
         )

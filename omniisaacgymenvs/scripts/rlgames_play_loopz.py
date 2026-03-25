@@ -216,6 +216,20 @@ def _compute_step_metrics(task_obj: Any) -> Dict[str, Any]:
         if torch.is_tensor(v) and v.numel() >= 1:
             metrics[name] = float(v[0].detach().cpu().item())
 
+    # Special-case: loopz USV task caches this term as a private attribute.
+    # Expose it under a stable public key for printing.
+    for candidate in ("turn_hazard_penalty", "_turn_hazard_penalty"):
+        v = _maybe_get_attr(inner_task, candidate)
+        if v is None:
+            continue
+        if torch.is_tensor(v) and v.numel() >= 1:
+            metrics["turn_hazard_penalty"] = float(v[0].detach().cpu().item())
+            break
+        fv = _to_float(v)
+        if fv is not None:
+            metrics["turn_hazard_penalty"] = float(fv)
+            break
+
     # Goal reached progress (if available)
     goal_reached = _maybe_get_attr(inner_task, "_goal_reached")
     if torch.is_tensor(goal_reached) and goal_reached.numel() >= 1:
@@ -273,6 +287,7 @@ def _format_step_line(
         "alignment_reward",
         "potential_shaping_reward",
         "boundary_penalty",
+        "turn_hazard_penalty",
         "collision_penalty",
     ]:
         if k in m:
@@ -407,8 +422,11 @@ def _format_mass_com_line(task_obj: Any, env_id: int = 0, obs_np: Optional[np.nd
             else np.asarray(com_obs_t, dtype=np.float32)
         )
         com_obs = [float(x) for x in com_obs_arr.reshape(-1)[:3]]
-    except Exception:
-        pass
+    # TODO: add support for 4D
+    except Exception as exc:
+        raise RuntimeError(
+            "mass/com: failed to compute observation-side encoded mass/CoM via MDD.get_masses()"
+        ) from exc
 
     raw_part = f"raw_mass={mass_raw:.4f} raw_com={com_raw_list}"
 

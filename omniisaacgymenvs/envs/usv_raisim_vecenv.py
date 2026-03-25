@@ -382,3 +382,196 @@ class USVRaisimVecEnv:
             f"finite_min={vmin} finite_max={vmax}; bad_env_ids={bad_env_ids}; "
             f"penalties=({', '.join(penalty_summary)}); dump={dump_path}"
         )
+
+
+class USVSysIDVecEnv(USVRaisimVecEnv):
+    """USV sysid 专用 wrapper：提供 masscom/非特权观测/history(flat) 等最小接口。
+
+    设计目标（按你的偏好）：
+    - 保持原有 `observe()` 语义不变（返回 full obs）
+    - 新增明确的 `observe_nonpriv()`：去掉最后 priv_dim（默认 4: mass+CoM）
+    - 维护 history buffer，并提供 `observe_history()` 展平输出 [N, T*obs_nonpriv_dim]
+    - 提供 `get_masscom()`：从 task.MDD.get_masses(...) 取 teacher 真值 [N,4]
+    - 可选 `debug_check_masscom_consistency()`：对齐检查 obs tail 与 MDD 输出
+    """
+
+    def __init__(
+        self,
+        base_env: Any,
+        *,
+        history_len: int = 50,
+        priv_dim: int = 4,
+        fill_history_on_reset: str = "repeat",
+        reward_info_size: int = 16,
+        device: Optional[Union[str, torch.device]] = None,
+    ) -> None:
+        super().__init__(base_env, reward_info_size=reward_info_size, device=device)
+
+        self.history_len = int(history_len)
+        self.priv_dim = int(priv_dim)
+        if self.history_len <= 0:
+            raise ValueError(f"history_len must be > 0, got {self.history_len}")
+        if self.priv_dim <= 0:
+            raise ValueError(f"priv_dim must be > 0, got {self.priv_dim}")
+
+        self.obs_nonpriv_dim = int(self.num_obs - self.priv_dim)
+        if self.obs_nonpriv_dim <= 0:
+            raise ValueError(
+                f"Invalid dims: num_obs={self.num_obs}, priv_dim={self.priv_dim} => obs_nonpriv_dim={self.obs_nonpriv_dim}"
+            )
+
+        if fill_history_on_reset not in {"repeat", "zeros"}:
+            raise ValueError("fill_history_on_reset must be 'repeat' or 'zeros'")
+        self._fill_history_on_reset = fill_history_on_reset
+
+        self._history_torch = torch.zeros(
+            (self.num_envs, self.history_len, self.obs_nonpriv_dim),
+            device=self._device,
+            dtype=torch.float32,
+        )
+        self._masscom_debug_checked = False
+
+    def reset(self) -> None:
+        super().reset()
+        self._reset_history_from_current_obs()
+
+    def step(self, action: ArrayLike) -> Tuple[np.ndarray, np.ndarray]:
+        reward_np, dones_np = super().step(action)
+        self._update_history_from_current_obs()
+        return reward_np, dones_np
+
+    def get_masscom(self) -> torch.Tensor:
+        """从运行中的 task 取 teacher masscom，shape [N,4] (torch, device=rl_device)."""
+
+        task = self._task
+        mdd = getattr(task, "MDD", None)
+        if mdd is None:
+            mdd = getattr(task, "mdd", None)
+        if mdd is None or not hasattr(mdd, "get_masses"):
+            raise AttributeError("Task has no MDD with method get_masses().")
+
+        mass_obs_mode = getattr(task, "_mass_obs_mode", None)
+        com_obs_mode = getattr(task, "_com_obs_mode", None)
+        com_scale = getattr(task, "_com_obs_scale", None)
+
+        try:
+            mass_t, com_t = mdd.get_masses(
+                mass_obs_mode=mass_obs_mode,
+                com_obs_mode=com_obs_mode,
+                com_scale=com_scale,
+            )
+        except TypeError:
+            # 兼容旧签名（不接 kwargs）
+            mass_t, com_t = mdd.get_masses(mass_obs_mode, com_obs_mode, com_scale)
+
+        if not torch.is_tensor(mass_t) or not torch.is_tensor(com_t):
+            raise TypeError("MDD.get_masses() must return torch tensors (mass_t, com_t).")
+
+        mass_t = mass_t.to(self._device, dtype=torch.float32)
+        com_t = com_t.to(self._device, dtype=torch.float32)
+
+        masscom_t = torch.cat([mass_t, com_t], dim=1)
+        if masscom_t.shape[0] != self.num_envs or masscom_t.shape[1] != 4:
+            raise ValueError(f"Expected masscom shape [N,4], got {tuple(masscom_t.shape)}")
+        return masscom_t
+
+    def observe_nonpriv(self) -> np.ndarray:
+        """返回去掉 priv tail 的观测：shape [N, obs_nonpriv_dim]。"""
+
+        obs_t = self._get_current_obs_torch()
+        nonpriv_t = obs_t[:, : self.obs_nonpriv_dim]
+        return nonpriv_t.detach().to("cpu").numpy().astype(np.float32, copy=False)
+
+    def observe_history(self) -> np.ndarray:
+        """返回展平后的历史 nonpriv：shape [N, history_len * obs_nonpriv_dim]。"""
+
+        hist = self._history_torch.reshape(self.num_envs, -1)
+        return hist.detach().to("cpu").numpy().astype(np.float32, copy=False)
+
+    def observe_sysid_obs(self) -> np.ndarray:
+        """便捷接口：拼接 [history_flat, current_nonpriv]，shape [N, T*D + D]。"""
+
+        history_flat = self.observe_history()
+        current_nonpriv = self.observe_nonpriv()
+        return np.concatenate([history_flat, current_nonpriv], axis=1)
+
+    def debug_check_masscom_consistency(
+        self,
+        obs_full: Optional[ArrayLike] = None,
+        *,
+        tol: float = 1e-5,
+        raise_on_fail: bool = False,
+        once: bool = True,
+    ) -> bool:
+        """检查 `obs_full` 的最后 4 维是否等于 `get_masscom()`。
+
+        - obs_full=None 时默认用当前内部缓存 `_last_obs_torch`。
+        - once=True 时只检查一次（避免每步开销）。
+        """
+
+        if once and self._masscom_debug_checked:
+            return True
+
+        if obs_full is None:
+            obs_t = self._get_current_obs_torch()
+        else:
+            if torch.is_tensor(obs_full):
+                obs_t = obs_full.to(self._device, dtype=torch.float32)
+            elif isinstance(obs_full, np.ndarray):
+                obs_t = torch.from_numpy(obs_full).to(self._device, dtype=torch.float32)
+            else:
+                raise TypeError("obs_full must be torch.Tensor, np.ndarray, or None")
+
+        if obs_t.shape[1] < self.priv_dim:
+            raise ValueError(f"obs_full dim too small: {tuple(obs_t.shape)}")
+
+        tail = obs_t[:, -self.priv_dim :]
+        masscom = self.get_masscom()
+        diff = (tail - masscom).abs()
+        max_err = float(diff.max().item()) if diff.numel() > 0 else 0.0
+
+        ok = max_err <= float(tol)
+        self._masscom_debug_checked = True
+        if ok:
+            return True
+
+        msg = f"[USVSysIDVecEnv] masscom consistency check failed: max_err={max_err:.3e} > tol={tol:.3e}"
+        if raise_on_fail:
+            raise RuntimeError(msg)
+        print(msg)
+        return False
+
+    def _get_current_obs_torch(self) -> torch.Tensor:
+        if self._last_obs_torch is None:
+            self.reset()
+        assert self._last_obs_torch is not None
+        return self._last_obs_torch
+
+    def _reset_history_from_current_obs(self) -> None:
+        current = self._get_current_obs_torch()[:, : self.obs_nonpriv_dim]
+        if self._fill_history_on_reset == "repeat":
+            self._history_torch[:] = current.unsqueeze(1).expand(-1, self.history_len, -1)
+        else:
+            self._history_torch.zero_()
+            self._history_torch[:, -1, :] = current
+
+    def _update_history_from_current_obs(self) -> None:
+        current = self._get_current_obs_torch()[:, : self.obs_nonpriv_dim]
+
+        # 滚动窗口：丢弃最旧帧，把新帧写到最后一帧。
+        self._history_torch = torch.roll(self._history_torch, shifts=-1, dims=1)
+        self._history_torch[:, -1, :] = current
+
+        # 对于 done env：当前 obs 通常已经是 reset 后的 obs；把历史清空再写入当前帧。
+        dones_t = self._last_dones_torch
+        if dones_t is None:
+            return
+        done_mask = dones_t.view(-1).bool()
+        if not bool(done_mask.any()):
+            return
+
+        if self._fill_history_on_reset == "repeat":
+            self._history_torch[done_mask] = current[done_mask].unsqueeze(1).expand(-1, self.history_len, -1)
+        else:
+            self._history_torch[done_mask].zero_()
+            self._history_torch[done_mask, -1, :] = current[done_mask]

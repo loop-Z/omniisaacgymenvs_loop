@@ -211,7 +211,7 @@ class USVVirtual(RLTask):
         self._default_marker_position = torch.tensor([0, 0, 1.0])
         self._marker = None
 
-        self.big=12
+        self.big=16
         self._blue_markers = [None] * self.big
         #self.set_targets(torch.arange(self._num_envs, device=self._device))
 

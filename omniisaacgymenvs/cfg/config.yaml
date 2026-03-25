@@ -40,6 +40,20 @@ checkpoint: ''
 # evaluate checkpoint
 evaluation: False
 
+# USV SysID visualization / deployment knobs (used by dagger_usv_viz_loopz.py)
+sysid:
+  # TorchScript checkpoints exported by dagger_usv_sysid_loopz.py
+  id_encoder_ckpt: ''
+  action_mlp_ckpt: ''
+  # Optional: loopz PPO full_*.pt dict checkpoint for teacher z* comparison
+  teacher_ckpt: ''
+  # Print latent mean/std and delta norms
+  print_latent_stats: True
+  # History length used by id_encoder
+  history_len: 50
+  # Privileged tail dim (mass+CoM) used by the task observation
+  mass_dim: 4
+
 # disables rendering
 headless: False
 # enables native livestream

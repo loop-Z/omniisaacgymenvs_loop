@@ -66,7 +66,7 @@ class CaptureXYTask(Core):
         #print("__init__",self._target_positions.shape)  # 输出: torch.Size([512, 2])
 
 
-        self.big=16  # 每个环境中障碍物的数量（包括目标点和其他障碍物）
+        self.big=12
 
         self._blue_pin_positions = torch.zeros(
             (self._num_envs, self.big, 3), device=self._device, dtype=torch.float32
@@ -97,6 +97,16 @@ class CaptureXYTask(Core):
         self.prev_position_dist = None
         # 用于“转头改进”奖励（每回合内差分）；初始化为 None，在第一次 compute_reward 时对齐。
         self.prev_heading_error = None
+
+        # Early-window behavior helpers (per-env counters)
+        # - early_step_counter: counts steps since reset (for early-window gating)
+        # - stall_count: counts consecutive "almost-not-moving" steps (for stall penalty)
+        self.early_step_counter = torch.zeros(
+            (self._num_envs), device=self._device, dtype=torch.int32
+        )
+        self.stall_count = torch.zeros(
+            (self._num_envs), device=self._device, dtype=torch.int32
+        )
         #self._num_envs = 512  # 强制设置 num_envs
 
 
@@ -355,6 +365,14 @@ class CaptureXYTask(Core):
         )
         reset_mask = self.just_had_been_reset.clone()
         self.distance_reward[reset_mask] = 0
+
+        # ---------------- Early window (2B) ----------------
+        # Use a per-env step counter to define the early phase. Reset envs start at 0.
+        if hasattr(self, "early_step_counter") and len(reset_mask) > 0:
+            self.early_step_counter[reset_mask] = 0
+            self.stall_count[reset_mask] = 0
+        early_K = 20
+        is_early = self.early_step_counter < early_K
         
         # TODO: Temporary fix
         # Align cross-episode distance history to avoid fake progress on the first step after reset.
@@ -412,6 +430,19 @@ class CaptureXYTask(Core):
         g = torch.clamp(torch.cos(self.heading_error), min=0.0, max=1.0)
         dist_pos = torch.clamp(self.distance_reward, min=0.0)
         dist_neg = torch.clamp(self.distance_reward, max=0.0)
+
+        # Early-window soft align gate (2A-in-2B): suppress forward progress incentives when misaligned.
+        # This reduces "turn-and-surge" collisions near spawn obstacles, without affecting mid/late episode behavior.
+        theta0 = 1.4
+        theta1 = 0.6
+        g_min = 0.15
+        g_align = torch.ones_like(g)
+        if is_early.any().item():
+            t = torch.clamp((theta0 - self.heading_error) / (theta0 - theta1 + 1e-6), 0.0, 1.0)
+            g_align_early = g_min + (1.0 - g_min) * t
+            g_align = torch.where(is_early, g_align_early, g_align)
+
+        # self.distance_reward = dist_neg + (g * g_align) * dist_pos
         self.distance_reward = dist_neg + g * dist_pos
 
         # ---------------- B2: explicit heading-improvement reward ----------------
@@ -465,21 +496,20 @@ class CaptureXYTask(Core):
         d1 = 0.01
         g_v = torch.clamp((v_toward_pos_for_gate - v0) / (v1 - v0 + 1e-6), 0.0, 1.0)
         g_d = torch.clamp(delta_d_pos / (d1 + 1e-6), 0.0, 1.0)
-        
         # 原方案
-        g_progress = torch.maximum(g_v, g_d)
+        # g_progress = torch.maximum(g_v, g_d)
         
-        # # g_safe: positive when the agent moves into a safer region (danger_factor decreases).
-        # # This helps gap-entry maneuvers where goal-progress is temporarily weak but safety improves.
-        # delta_safe = self.prev_danger_factor - danger_factor
-        # delta_safe_pos = torch.clamp(delta_safe, min=0.0)
-        # s1 = 0.02
-        # g_safe = torch.clamp(delta_safe_pos / (s1 + 1e-6), 0.0, 1.0)
+        # g_safe: positive when the agent moves into a safer region (danger_factor decreases).
+        # This helps gap-entry maneuvers where goal-progress is temporarily weak but safety improves.
+        delta_safe = self.prev_danger_factor - danger_factor
+        delta_safe_pos = torch.clamp(delta_safe, min=0.0)
+        s1 = 0.02
+        g_safe = torch.clamp(delta_safe_pos / (s1 + 1e-6), 0.0, 1.0)
 
-        # # Cache per-step safety-progress gate for episode logging.
-        # self._g_safe = g_safe
+        # Cache per-step safety-progress gate for episode logging.
+        self._g_safe = g_safe
 
-        # g_progress = torch.maximum(torch.maximum(g_v, g_d), g_safe)
+        g_progress = torch.maximum(torch.maximum(g_v, g_d), g_safe)
 
         # S2-b: heading gate
         # heading gate (reuse g computed above: g = clamp(cos(heading_error), 0, 1))
@@ -553,6 +583,9 @@ class CaptureXYTask(Core):
         # Smooth saturation: in [0, 0.05). v_ref roughly matches the previous target_speed scale.
         v_ref = 0.8
         speed_reward = (1.0 - torch.exp(-v_toward_pos / (v_ref + 1e-6))) * 0.05
+        # Early-window: gate forward-speed incentive when misaligned.
+        speed_reward = torch.where(is_early, speed_reward * g_align, speed_reward)
+        self._early_g_align = g_align
 
         angular_vel = current_state["angular_velocity"]  # (N,)
         heading_error_threshold = 1.0  # 弧度 ≈ 57.3°
@@ -575,6 +608,28 @@ class CaptureXYTask(Core):
             ).float()
             * 0.05
         )
+
+        # ---------------- Early-window stall penalty (only penalize "doing nothing") ----------------
+        # If the agent is neither translating nor rotating for too long in the early phase, add a small penalty.
+        # This breaks left-vs-right indecision without discouraging in-place turning.
+        v_stall = 0.05
+        w_stall = 0.10
+        stall_N = 6
+        stall_M = 6
+        c_stall = 0.05
+
+        is_stall = (linear_speed < v_stall) & (torch.abs(angular_vel) < w_stall)
+        stall_active = is_early & is_stall
+        # Update consecutive stall counter.
+        self.stall_count = torch.where(
+            stall_active,
+            self.stall_count + 1,
+            torch.zeros_like(self.stall_count),
+        )
+
+        ramp = torch.clamp((self.stall_count.to(dtype=torch.float32) - float(stall_N) + 1.0) / float(stall_M), 0.0, 1.0)
+        stall_penalty = -c_stall * ramp
+        self._stall_penalty = stall_penalty
 
 
 
@@ -611,8 +666,9 @@ class CaptureXYTask(Core):
                     + self.alignment_reward * 0.5
                     + self.potential_shaping_reward * 2.0  # 如果你取消了注释，记得在这里加上
                     + turn_hazard_penalty
+                    + stall_penalty
                     + goal_reward
-                    # + self._task_parameters.time_reward
+                    + self._task_parameters.time_reward
                     + self.collision_penalty
                     + speed_reward
                     + angular_reward
@@ -631,6 +687,9 @@ class CaptureXYTask(Core):
         self.episode_sums["goal"] += goal_reward
         self.episode_sums["total"] += total_reward
         self.episode_sums["turn_hazard_penalty"] += turn_hazard_penalty
+
+        # Advance early-window step counter after computing rewards.
+        self.early_step_counter += 1
         return total_reward
 
 
@@ -751,6 +810,12 @@ class CaptureXYTask(Core):
 
         self.xunlian_pos[env_ids, :, :] = 0.0
         self.xunlian_pos[env_ids, :, 2] = 2.0  # Fixed z coordinate
+
+        # Reset early-window counters.
+        if hasattr(self, "early_step_counter"):
+            self.early_step_counter[env_ids] = 0
+        if hasattr(self, "stall_count"):
+            self.stall_count[env_ids] = 0
 
         # if hasattr(self, 'episode_sums'):
         #     for key in self.episode_sums.keys():

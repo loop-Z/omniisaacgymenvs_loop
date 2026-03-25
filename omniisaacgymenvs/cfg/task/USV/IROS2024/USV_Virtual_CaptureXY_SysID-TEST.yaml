@@ -88,15 +88,15 @@ env:
       # Add mass randomization
       add_mass_disturbances: True  ###########################True
       min_mass: 34.96
-      max_mass: 36.96
+      max_mass: 38.96             # 36.96
       # Legacy (backward compatible): CoM randomization radius in the XY plane (meters).
       # If `com_displacement_xyz` is provided, the code will use that instead.
       # Note: legacy mode keeps Z unchanged (dz = 0).
       CoM_max_displacement: 0.0
-      base_mass: 35.96
+      base_mass: 34.96
       # New (recommended): anisotropic bounded CoM randomization in meters (body frame)
       # More variation along length (x), less along width/height (y/z)
-      com_displacement_xyz: [0.15, 0.05, 0.01]
+      com_displacement_xyz: [0.15, 0.05, 0.02]  # max random displacement along x, y, z from the base CoM
       base_com: [0.0, 0.0, 0.0]
       apply_com_to_sim: True
 
@@ -143,7 +143,7 @@ env:
     kill_dist: 20.0
     boundary_cost: 25.0
     goal_reward: 20.0 # Goal reward for reaching the goal
-    time_reward: -0.1 # Time penalty for each step  原先-0.2
+    time_reward: -0.05 # Time penalty for each step  原先-0.2
 
   reward_parameters:
     name: CaptureXY  # CaptureXY
@@ -152,7 +152,7 @@ env:
 
   penalties_parameters:
     penalize_energy: True
-    penalize_energy_fn: "lambda x,step : -torch.sum(x, dim=-1) * 0.005-0.05"
+    penalize_energy_fn: "lambda x,step : -torch.sum(x, dim=-1) * 0.005 - 0.05"
     penalize_energy_c1: 0.00 # Not used in this version
     penalize_energy_c2: 0.00 # Not used in this version
     penalize_linear_velocities: False
@@ -307,7 +307,7 @@ dynamics:
     amplify_torque: 1.0
     material_density: 133
     water_density: 1000
-    mass: 35.96
+    mass: 34.96
     box_width: 1.0
     box_length: 1.3
     waterplane_area: 0.233333 # Kingfisher/Heron draught 120mm in Spec Sheet
