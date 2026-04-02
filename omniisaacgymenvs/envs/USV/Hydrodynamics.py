@@ -24,6 +24,19 @@ class HydrodynamicsObject:
         last_time,
     ):
         self._use_drag_randomization = task_cfg["use_drag_randomization"]
+
+        # Episode-wise overall drag/damping scale (k_drag) applied to the full damping matrix.
+        # Backward compatible: default disabled.
+        self._use_drag_scale_randomization = bool(
+            task_cfg.get("use_drag_scale_randomization", False)
+        )
+        self._k_drag_min = float(task_cfg.get("k_drag_min", 1.0))
+        self._k_drag_max = float(task_cfg.get("k_drag_max", 1.0))
+        self._k_drag_sample_space = str(task_cfg.get("k_drag_sample_space", "linear"))
+        if self._k_drag_sample_space not in ("linear", "log"):
+            raise ValueError(
+                f"k_drag_sample_space must be 'linear' or 'log', got {self._k_drag_sample_space}"
+            )
         # linear_rand range, calculated as a percentage of the base damping coefficients
         self._linear_rand = torch.tensor(
             [
@@ -53,6 +66,13 @@ class HydrodynamicsObject:
         self.drag = torch.zeros(
             (self._num_envs, 6), dtype=torch.float32, device=self.device
         )
+
+        # Per-environment drag scale buffer.
+        self.drag_scale = torch.ones(
+            (self._num_envs, 1), dtype=torch.float32, device=self.device
+        )
+        if self._use_drag_scale_randomization:
+            self.drag_scale[:, :] = self._sample_k_drag(self._num_envs)
 
         # damping parameters (individual set for each environment)
         self.linear_damping_base = linear_damping
@@ -96,6 +116,23 @@ class HydrodynamicsObject:
 
         return
 
+    def _sample_k_drag(self, n: int) -> torch.Tensor:
+        """Sample k_drag for n environments. Returns shape (n, 1) tensor on device."""
+        if n <= 0:
+            return torch.ones((0, 1), dtype=torch.float32, device=self.device)
+        kmin = float(self._k_drag_min)
+        kmax = float(self._k_drag_max)
+        if kmin <= 0.0 or kmax <= 0.0:
+            raise ValueError(f"k_drag_min/max must be > 0, got {kmin}, {kmax}")
+        if kmax < kmin:
+            raise ValueError(f"k_drag_max must be >= k_drag_min, got {kmin}, {kmax}")
+        u = torch.rand((n, 1), dtype=torch.float32, device=self.device)
+        if self._k_drag_sample_space == "log":
+            log_min = torch.log(torch.tensor(kmin, dtype=torch.float32, device=self.device))
+            log_max = torch.log(torch.tensor(kmax, dtype=torch.float32, device=self.device))
+            return torch.exp(log_min + u * (log_max - log_min))
+        return kmin + u * (kmax - kmin)
+
     def reset_coefficients(self, env_ids: torch.Tensor, num_resets: int) -> None:
         """
         Resets the drag coefficients for the specified environments.
@@ -125,6 +162,10 @@ class HydrodynamicsObject:
                 ).expand_as(noise_quad)
                 + noise_quad
             )
+
+        # Episode-wise drag scale randomization.
+        if self._use_drag_scale_randomization:
+            self.drag_scale[env_ids, :] = self._sample_k_drag(num_resets)
         # Debug : print the updated coefficients
         # print("Updated linear damping for reset envs:", self.linear_damping[env_ids])
         # print(
@@ -156,6 +197,10 @@ class HydrodynamicsObject:
         # print("quad_damp: ", quad_damp)
         # scaling and adding both matrices
         damping_matrix = (lin_damp + quad_damp) * self.scaling_damping
+
+        # Optional overall scale (k_drag) applied to the entire damping matrix.
+        if self._use_drag_scale_randomization:
+            damping_matrix = damping_matrix * self.drag_scale
         # print("damping_matrix: ", damping_matrix)
         return damping_matrix
 

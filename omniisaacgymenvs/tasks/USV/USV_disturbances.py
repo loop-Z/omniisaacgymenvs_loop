@@ -193,6 +193,56 @@ class MassDistributionDisturbances:
 
         return (mass_out, com_out)
 
+    def get_base_masses(
+        self,
+        *,
+        mass_obs_mode: str = "raw",
+        com_obs_mode: str = "raw",
+        com_scale: Optional[Union[Tuple[float, float, float], torch.Tensor]] = None,
+        eps: float = 1e-6,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return observation-side encoded mass/CoM corresponding to the *base* values.
+
+        This does NOT modify the simulation parameters. It is intended for ablations where
+        dynamics are randomized in sim but the policy is fed fixed (base) mass/CoM in obs.
+
+        Shapes:
+            mass_out: (num_envs, 1)
+            com_out : (num_envs, 3)
+        """
+
+        # Base mass encoding
+        if mass_obs_mode == "raw":
+            mass_out = (
+                torch.ones((self._num_envs, 1), device=self._device, dtype=torch.float32)
+                * float(self._base_mass)
+            )
+        elif mass_obs_mode == "relative":
+            mass_out = torch.zeros((self._num_envs, 1), device=self._device, dtype=torch.float32)
+        else:
+            raise ValueError(f"Unknown mass_obs_mode: {mass_obs_mode}")
+
+        # Base CoM encoding
+        if com_obs_mode == "raw":
+            com_out = self._base_com.unsqueeze(0).repeat(self._num_envs, 1)
+        elif com_obs_mode == "scaled":
+            if com_scale is None:
+                raise ValueError("com_scale must be provided when com_obs_mode='scaled'")
+            if isinstance(com_scale, torch.Tensor):
+                scale_t = com_scale.to(device=self._device, dtype=torch.float32)
+            else:
+                scale_t = torch.tensor(
+                    [float(com_scale[0]), float(com_scale[1]), float(com_scale[2])],
+                    device=self._device,
+                    dtype=torch.float32,
+                )
+            base_com = self._base_com.unsqueeze(0).repeat(self._num_envs, 1)
+            com_out = base_com / (scale_t + eps)
+        else:
+            raise ValueError(f"Unknown com_obs_mode: {com_obs_mode}")
+
+        return (mass_out, com_out)
+
     def set_masses(
         self, body: omni.isaac.core.prims.XFormPrimView, idx: torch.Tensor
     ) -> None:

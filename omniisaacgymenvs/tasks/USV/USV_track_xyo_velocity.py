@@ -73,7 +73,12 @@ class TrackXYOVelocityTask(Core):
         return stats
 
     def get_state_observations(
-        self, current_state: dict, observation_frame: str
+        self,
+        current_state: dict,
+        observation_frame: str,
+        mass: torch.Tensor = None,
+        com: torch.Tensor = None,
+        prev_action: torch.Tensor = None,
     ) -> torch.Tensor:
         """
         Computes the observation tensor from the current state of the robot.""" ""
@@ -87,7 +92,7 @@ class TrackXYOVelocityTask(Core):
         self._position_error = current_state["position"]
         self._task_data[:, :2] = self._linear_velocity_error
         self._task_data[:, 2] = self._angular_velocity_error
-        return self.update_observation_tensor(current_state, observation_frame)
+        return self.update_observation_tensor(current_state, observation_frame, mass, com, prev_action)
 
     def compute_reward(
         self, current_state: torch.Tensor, actions: torch.Tensor

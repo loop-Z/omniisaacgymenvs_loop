@@ -296,6 +296,11 @@ def main(cfg: DictConfig):
     teacher_ckpt = _resolve_ckpt(str(getattr(sysid_cfg, "teacher_ckpt", "")))
     print_latent_stats = bool(getattr(sysid_cfg, "print_latent_stats", True))
 
+    # Optional debug/evaluation switch: force latent to zero for comparison experiments
+    zero_latent = bool(getattr(sysid_cfg, "zero_latent", False))
+    if zero_latent:
+        print("[sysid-viz] zero_latent=True: id-encoder output will be replaced with zeros for evaluation")
+
     history_len = int(getattr(sysid_cfg, "history_len", 50))
     mass_dim = int(getattr(sysid_cfg, "mass_dim", 4))
 
@@ -442,6 +447,13 @@ def main(cfg: DictConfig):
                     if zhat.shape[1] != mass_latent_dim:
                         # Support truncated/expanded scripted graphs by slicing to expected dim.
                         zhat = zhat[:, :mass_latent_dim]
+
+                    # If requested, replace encoder output with zeros (same shape/dtype/device)
+                    if zero_latent:
+                        try:
+                            zhat = torch.zeros_like(zhat)
+                        except Exception:
+                            zhat = torch.zeros(zhat.size(), device=zhat.device, dtype=zhat.dtype)
 
                     act_in = torch.cat([cur_t, zhat], dim=1)
                     action_t = action_mlp_ts(act_in)

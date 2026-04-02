@@ -93,7 +93,8 @@ class CaptureXYTask(Core):
         # Collision parameters
         self.collision_threshold = 1.2  # Half of USV diagonal (sqrt(1.35^2 + 0.98^2) / 2) +0.5=0.83 +0.5=1.4
         self.collision_penalty = -10.0  # Penalty for collision with obstacles
-        self._num_observations = 8 +  self.n_closest_obs * 3   # 2 (velocity) + 1 (angular velocity) + 5 (task data) + 24 (obstacle relative positions)
+        # Core layout: speed(3) + task_data(5 + n_closest_obs*3) + prev_action(2) + priv(4)
+        self._num_observations = 8 + self.n_closest_obs * 3 + 2 + 4
         self._task_data = torch.zeros(
             (num_envs, 5 + self.n_closest_obs * 3), device=device, dtype=torch.float32
         )  # 5 (original task data) + 24 (12 obstacles * 2D)
@@ -146,7 +147,12 @@ class CaptureXYTask(Core):
 
 
     def get_state_observations(
-        self, current_state: dict, observation_frame: str, mass: torch.Tensor = None, com: torch.Tensor = None
+        self,
+        current_state: dict,
+        observation_frame: str,
+        mass: torch.Tensor = None,
+        com: torch.Tensor = None,
+        prev_action: torch.Tensor = None,
     ) -> torch.Tensor:
 
         self.current_state=current_state
@@ -236,7 +242,7 @@ class CaptureXYTask(Core):
 
         # --- 【修改结束】 ---
 
-        return self.update_observation_tensor(current_state, observation_frame, mass, com)
+        return self.update_observation_tensor(current_state, observation_frame, mass, com, prev_action)
 
     
     def _get_potential_values(self, positions):

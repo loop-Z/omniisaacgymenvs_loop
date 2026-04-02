@@ -155,6 +155,12 @@ class USVVirtual(RLTask):
             device=self._device,
             dtype=torch.float32,
         )
+        # One-step action history (raw policy thrust commands in [-1, 1] before noise/clamp).
+        self.prev_thrust_cmds = torch.zeros(
+            (self._num_envs, self._num_actions),
+            device=self._device,
+            dtype=torch.float32,
+        )
         self.heading = torch.zeros(
             (self._num_envs, 2), device=self._device, dtype=torch.float32
         )
@@ -403,7 +409,9 @@ class USVVirtual(RLTask):
     def get_observations(self) -> Dict[str, torch.Tensor]:
         self.update_state()
         self.obs_buf["state"] = self.task.get_state_observations(
-            self.current_state, self._observation_frame
+            self.current_state,
+            self._observation_frame,
+            prev_action=self.prev_thrust_cmds,
         )
         observations = {self._heron.name: {"obs_buf": self.obs_buf}}
         return observations
@@ -422,6 +430,12 @@ class USVVirtual(RLTask):
             thrust_cmds = self.actions.float()
         else:
             raise NotImplementedError("")
+
+        # Cache prev_action for next observation (raw command, before noise/clamp).
+        self.prev_thrust_cmds[:, :] = thrust_cmds
+        if len(reset_env_ids) > 0:
+            self.prev_thrust_cmds[reset_env_ids, :] = 0.0
+
         thrusts = thrust_cmds
         thrusts = self.AN.add_noise_on_act(thrusts)
         thrusts = torch.clamp(thrusts, -1.0, 1.0)
@@ -667,6 +681,10 @@ class USVVirtual(RLTask):
         # Bookkeeping
         self.reset_buf[env_ids] = 0
         self.progress_buf[env_ids] = 0
+
+        # Reset one-step action history.
+        if hasattr(self, "prev_thrust_cmds"):
+            self.prev_thrust_cmds[env_ids, :] = 0.0
         # Fill `extras`
         self.extras["episode"] = {}
         for key in self.episode_sums.keys():

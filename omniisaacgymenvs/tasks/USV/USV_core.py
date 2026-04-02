@@ -20,13 +20,19 @@ class Core:
     The core class that implements basic functions used by all tasks.
     It is designed to be inherited by specific tasks."""
     
-    def __init__(self, num_envs: int, device: str) -> None:
+    def __init__(self, num_envs: int, device: str, action_dim: int = 2) -> None:
         # Number of environments and device
         self._num_envs = num_envs
         self._device = device
         self.n_closest_obs = 5
+        self.action_dim = int(action_dim)
+        if self.action_dim <= 0:
+            raise ValueError(f"action_dim must be > 0, got {self.action_dim}")
         # Observation buffer
-        self._num_observations = 8 + self.n_closest_obs * 3 + 4 # Updated to match CaptureXYTask (2 + 1 + 5 + 15 + 4)
+        # USV obs layout (default):
+        #   [speed(3), task_data(5 + n_closest_obs*3), prev_action(action_dim), priv(mass+CoM=4)]
+        # total = 8 + n_closest_obs*3 + action_dim + 4
+        self._num_observations = 8 + self.n_closest_obs * 3 + self.action_dim + 4
         self._obs_buffer = torch.zeros(
             (self._num_envs, self._num_observations), device=self._device, dtype=torch.float32
         )
@@ -35,7 +41,14 @@ class Core:
         self._task_label = torch.ones((num_envs,), device=device, dtype=torch.int32)
 
     # def update_observation_tensor(self, current_state: dict, observation_frame: str) -> torch.Tensor:
-    def update_observation_tensor(self, current_state: dict, observation_frame: str, mass: torch.Tensor = None, com: torch.Tensor = None) -> torch.Tensor:
+    def update_observation_tensor(
+        self,
+        current_state: dict,
+        observation_frame: str,
+        mass: torch.Tensor = None,
+        com: torch.Tensor = None,
+        prev_action: torch.Tensor = None,
+    ) -> torch.Tensor:
         """
         Updates the observation tensor with the current state.
         Args:
@@ -44,7 +57,7 @@ class Core:
         Returns:
             torch.Tensor: Observation tensor.
         """
-        #self._obs_buffer观测空间 是一个形状为 [num_envs, 32] 的张量，总共 32 维
+        # self._obs_buffer 观测空间：shape = [num_envs, num_obs]
         #第 0-1 维（2 维）：USV 的局部坐标系速度。
         # USV 的线性速度（current_state["linear_velocity"]，全局坐标系的 [vx, vy]）经过旋转转换后的结果，变成了相对于 USV 朝向的局部速度。
         #第 2 维（1 维）：USV 的角速度
@@ -53,6 +66,16 @@ class Core:
         #第 0-1 维（2 维）：目标方向的余弦和正弦（cos(alpha) 和 sin(alpha)）。
         #第 2 维（1 维）：USV 到目标的距离。
 
+        # Slices
+        priv_dim = 4
+        prev_action_dim = self.action_dim
+        prev_action_start = self._num_observations - priv_dim - prev_action_dim
+        prev_action_end = self._num_observations - priv_dim
+        task_start = 3
+        task_end = prev_action_start
+
+        # Always clear privileged tail to avoid stale values when mass/com are not provided.
+        self._obs_buffer[:, self._num_observations - priv_dim : self._num_observations] = 0.0
 
         if observation_frame == "local":
             cos_theta = current_state["orientation"][:, 0]
@@ -66,9 +89,14 @@ class Core:
                 + cos_theta * current_state["linear_velocity"][:, 1]
             )
             self._obs_buffer[:, 2] = current_state["angular_velocity"]
-            # Updated to match 29-dimensional task_data
-            # Exclude last 4 dims for mass and CoM
-            self._obs_buffer[:, 3:self._num_observations-4] = self._task_data  
+            # task_data occupies [3 : prev_action_start)
+            self._obs_buffer[:, task_start:task_end] = self._task_data
+
+            # prev_action occupies [prev_action_start : prev_action_end)
+            self._obs_buffer[:, prev_action_start:prev_action_end] = 0.0
+            if prev_action is not None:
+                # Expect shape [N, action_dim]
+                self._obs_buffer[:, prev_action_start:prev_action_end] = prev_action
             
             # Add mass and CoM information to the last 4 dimensions if provided
             if mass is not None:
@@ -79,7 +107,11 @@ class Core:
         elif observation_frame == "global":
             self._obs_buffer[:, 0:2] = current_state["linear_velocity"][:, :2]
             self._obs_buffer[:, 2] = current_state["angular_velocity"]
-            self._obs_buffer[:, 3:self._num_observations-4] = self._task_data  # Updated to match 29-dimensional task_data
+            self._obs_buffer[:, task_start:task_end] = self._task_data
+
+            self._obs_buffer[:, prev_action_start:prev_action_end] = 0.0
+            if prev_action is not None:
+                self._obs_buffer[:, prev_action_start:prev_action_end] = prev_action
             
             # Add mass and CoM information to the last 4 dimensions if provided
             if mass is not None:
@@ -95,7 +127,14 @@ class Core:
 
         raise NotImplementedError
 
-    def get_state_observations(self, current_state: dict) -> torch.Tensor:
+    def get_state_observations(
+        self,
+        current_state: dict,
+        observation_frame: str,
+        mass: torch.Tensor = None,
+        com: torch.Tensor = None,
+        prev_action: torch.Tensor = None,
+    ) -> torch.Tensor:
         """
         Computes the observation tensor from the current state of the robot.""" ""
 

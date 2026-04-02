@@ -265,6 +265,70 @@ def _compute_episode_conditions(task_obj: Any, *, env_id: int = 0, obs_np: Optio
     except Exception:
         pass
 
+    # ----- NPZ scene replay audit (npz_hash vs sim_hash) -----
+    # TODO:添加场景重放的hash校验，确保重放的场景和当前仿真环境中的障碍物布局一致。这对于验证重放功能的正确性非常重要。
+    try:
+        replay_enabled = bool(_maybe_get_attr(base_task, "scene_replay_enabled") or False)
+        cond["scene_replay_enabled"] = bool(replay_enabled)
+        cond["scene_idx"] = int(-1)
+        cond["npz_obstacles_hash"] = ""
+        cond["obstacles_hash_match"] = ""
+
+        if replay_enabled:
+            # Scene index used for this env's latest reset (provided by task wrapper)
+            last_idx = _maybe_get_attr(base_task, "scene_replay_last_scene_idx")
+            if torch.is_tensor(last_idx) and last_idx.numel() > int(env_id):
+                scene_idx = int(last_idx[int(env_id)].detach().cpu().item())
+            else:
+                scene_idx = int(-1)
+            cond["scene_idx"] = int(scene_idx)
+
+            data = _maybe_get_attr(base_task, "_scene_replay_npz_data")
+            if isinstance(data, dict) and scene_idx >= 0:
+                obs_xy_npz = np.asarray(data.get("obstacles_xy"))[int(scene_idx)]
+                obs_count_npz = int(np.asarray(data.get("obstacles_count"))[int(scene_idx)])
+
+                # Normalize to (big, 2) and apply the same limbo rule as task.apply_scene().
+                big = int(_maybe_get_attr(inner_task, "big") or obs_xy_npz.shape[0])
+                limbo = np.array([999.0, 999.0], dtype=np.float32)
+
+                if obs_xy_npz.ndim == 2 and obs_xy_npz.shape[1] >= 2:
+                    obs_xy_npz2 = obs_xy_npz[:, :2].astype(np.float32, copy=False)
+                elif obs_xy_npz.ndim == 3 and obs_xy_npz.shape[-1] >= 2:
+                    obs_xy_npz2 = obs_xy_npz.reshape(-1, obs_xy_npz.shape[-1])[:, :2].astype(np.float32, copy=False)
+                else:
+                    obs_xy_npz2 = np.zeros((0, 2), dtype=np.float32)
+
+                if obs_xy_npz2.shape[0] < big:
+                    pad = np.repeat(limbo[None, :], big - obs_xy_npz2.shape[0], axis=0)
+                    obs_xy_npz2 = np.concatenate([obs_xy_npz2, pad], axis=0)
+                else:
+                    obs_xy_npz2 = obs_xy_npz2[:big, :]
+
+                c = int(max(0, min(big, obs_count_npz)))
+                if c < big:
+                    obs_xy_npz2 = obs_xy_npz2.copy()
+                    obs_xy_npz2[c:, :] = limbo[None, :]
+
+                npz_hash = _hash_obstacles_xy(obs_xy_npz2, quant_m=float(cond.get("obstacles_hash_quant_m", 0.01)))
+                cond["npz_obstacles_hash"] = str(npz_hash)
+
+                sim_hash = str(cond.get("obstacles_hash") or "")
+                match = bool(npz_hash) and bool(sim_hash) and (npz_hash == sim_hash)
+                cond["obstacles_hash_match"] = bool(match)
+
+                strict = bool(_maybe_get_attr(base_task, "scene_replay_strict_hash") or False)
+                if strict and not match:
+                    raise RuntimeError(
+                        f"[scene_replay][hash_mismatch] scene_idx={scene_idx} npz_hash={npz_hash} sim_hash={sim_hash}"
+                    )
+    except RuntimeError:
+        # strict mode or explicit fail-fast
+        raise
+    except Exception:
+        # Keep play robust: if audit fails unexpectedly, do not crash.
+        pass
+
     # ----- Start/goal snapshot from metrics (preferred) -----
     try:
         m0 = _compute_step_metrics(base_task)
@@ -971,6 +1035,12 @@ def parse_hydra_configs(cfg: DictConfig):
             "obstacles_limbo_count",
             "obstacles_hash_quant_m",
             "obstacles_hash",
+
+            # NPZ scene replay audit
+            "scene_replay_enabled",
+            "scene_idx",
+            "npz_obstacles_hash",
+            "obstacles_hash_match",
 
             "success",
             "done_reason",

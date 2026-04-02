@@ -1,6 +1,6 @@
 environment:
   # ---- loopz 实际读取（影响训练逻辑）----
-  baseDim: 27
+  baseDim: 29
   geomDim: 0
   n_futures: 1
   # ---- USV 观测协议切分（用于后续替换 baseDim/geomDim 语义）----

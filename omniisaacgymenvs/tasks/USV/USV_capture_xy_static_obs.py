@@ -103,7 +103,8 @@ class CaptureXYTask(Core):
         # 碰撞相关参数
         self.collision_threshold = 1.2  # Half of USV diagonal (sqrt(1.35^2 + 0.98^2) / 2) +0.5=0.83 +0.5=1.4
         self.collision_penalty = -10.0  # 与障碍物碰撞的惩罚
-        self._num_observations = 8 +  self.n_closest_obs * 3 + 4  # 2（速度）+ 1（角速度）+ 5（任务数据）+ 24（障碍物相对位置）
+        # Core layout: speed(3) + task_data(5 + n_closest_obs*3) + prev_action(2) + priv(4)
+        self._num_observations = 8 + self.n_closest_obs * 3 + 2 + 4
         self._task_data = torch.zeros(
             (num_envs, 5 + self.n_closest_obs * 3), device=device, dtype=torch.float32
         )  # 5（原始任务数据）+ 24（12 个障碍物 * 2D）
@@ -187,7 +188,12 @@ class CaptureXYTask(Core):
 
 
     def get_state_observations(
-        self, current_state: dict, observation_frame: str, mass: torch.Tensor = None, com: torch.Tensor = None
+        self,
+        current_state: dict,
+        observation_frame: str,
+        mass: torch.Tensor = None,
+        com: torch.Tensor = None,
+        prev_action: torch.Tensor = None,
     ) -> torch.Tensor:
 
         self.current_state=current_state
@@ -279,7 +285,7 @@ class CaptureXYTask(Core):
 
         # --- 【修改结束】 ---
 
-        return self.update_observation_tensor(current_state, observation_frame, mass, com)
+        return self.update_observation_tensor(current_state, observation_frame, mass, com, prev_action)
 
     
     def _get_potential_values(self, positions):
@@ -756,6 +762,87 @@ class CaptureXYTask(Core):
         #     for key in self.episode_sums.keys():
         #         self.episode_sums[key][env_ids] = 0.0
 
+    # TODO: 固定路径新增接口，接受局部坐标的障碍物和目标位置，更新语义缓冲区并重计算势能场。
+    def apply_scene(
+        self,
+        env_ids: torch.Tensor,
+        *,
+        obstacles_xy_local: torch.Tensor,
+        obstacles_count: torch.Tensor,
+        goal_xy_local: torch.Tensor,
+    ) -> None:
+        """Apply a deterministic scene spec (goal + obstacles) for given envs.
+
+        Coordinates are *local* (relative to each env origin).
+        Updates semantic buffers and recomputes the per-env potential field.
+        """
+
+        if env_ids is None or len(env_ids) == 0:
+            return
+
+        env_long = env_ids.long()
+        n = int(env_long.numel())
+
+        if not torch.is_tensor(obstacles_xy_local):
+            raise TypeError("obstacles_xy_local must be a torch.Tensor")
+        if not torch.is_tensor(obstacles_count):
+            raise TypeError("obstacles_count must be a torch.Tensor")
+        if not torch.is_tensor(goal_xy_local):
+            raise TypeError("goal_xy_local must be a torch.Tensor")
+
+        obstacles_xy_local = obstacles_xy_local.to(device=self._device, dtype=torch.float32)
+        obstacles_count = obstacles_count.to(device=self._device, dtype=torch.long).view(-1)
+        goal_xy_local = goal_xy_local.to(device=self._device, dtype=torch.float32)
+
+        if goal_xy_local.shape != (n, 2):
+            raise ValueError(
+                f"goal_xy_local must have shape (len(env_ids), 2)={(n, 2)}, got {tuple(goal_xy_local.shape)}"
+            )
+
+        if obstacles_xy_local.ndim != 3 or obstacles_xy_local.shape[-1] != 2:
+            raise ValueError(
+                f"obstacles_xy_local must have shape (n, k, 2), got {tuple(obstacles_xy_local.shape)}"
+            )
+
+        big = int(self.big)
+        k = int(obstacles_xy_local.shape[1])
+
+        # Normalize obstacle tensor to (n, big, 2)
+        limbo_xy = torch.tensor([999.0, 999.0], device=self._device, dtype=torch.float32)
+        if k < big:
+            pad = limbo_xy.view(1, 1, 2).repeat(n, big - k, 1)
+            obs_xy = torch.cat([obstacles_xy_local, pad], dim=1)
+        else:
+            obs_xy = obstacles_xy_local[:, :big, :]
+
+        # Enforce obstacles_count by sending the remainder to limbo.
+        idx = torch.arange(big, device=self._device, dtype=torch.long).view(1, -1)
+        keep = idx < obstacles_count.view(-1, 1).clamp(min=0, max=big)
+        obs_xy = torch.where(keep.unsqueeze(-1), obs_xy, limbo_xy.view(1, 1, 2))
+
+        # Goal offsets in local frame
+        self._target_positions[env_long, :] = goal_xy_local
+
+        # Obstacles in local frame
+        self.xunlian_pos[env_long, :, :] = 0.0
+        self.xunlian_pos[env_long, :, 2] = 2.0
+        self.xunlian_pos[env_long, :, :2] = obs_xy
+
+        # Obstacles in world frame (for marker views)
+        if self._env is None or not hasattr(self._env, "_env_pos"):
+            raise RuntimeError("CaptureXYTask.apply_scene requires self._env._env_pos to be available")
+        env_origin = self._env._env_pos[env_long, :2].unsqueeze(1)  # (n,1,2)
+        self._blue_pin_positions[env_long, :, :] = 0.0
+        self._blue_pin_positions[env_long, :, 2] = 2.0
+        self._blue_pin_positions[env_long, :, :2] = obs_xy + env_origin
+
+        # Potential field depends on both obstacles and target
+        target_pos = self._target_positions[env_long]
+        occupancy, sdf = self.gpu_map.compute_occupancy_and_sdf(obs_xy)
+        cost_field = self.gpu_map.compute_cost_field_wavefront(occupancy, target_pos)
+        subset_potential = self.gpu_map.compute_potential_field(cost_field, sdf)
+        self.global_potential_field[env_long] = subset_potential
+
 
     def generate_target(self, path, position):
         #generate_target 方法负责生成一个红色视觉标志物1, 0, 0  绿0，1，0  蓝0，0，1
@@ -865,14 +952,26 @@ class CaptureXYTask(Core):
         start_pos = initial_position[env_ids, :2] - self._env._env_pos[env_ids, :2]
         target_pos = self._target_positions[env_ids]
 
-        min_coords = (target_pos - 15.0).unsqueeze(1) 
-        max_coords = (target_pos + 15.0).unsqueeze(1)
+        min_coords = (target_pos - 12.0).unsqueeze(1) 
+        max_coords = (target_pos + 12.0).unsqueeze(1)
         
         obs_centers = torch.rand((num_goals, num_obs, 2), device=self._device)
         obs_centers = obs_centers * (max_coords - min_coords) + min_coords
 
         max_iterations = 20
-        min_dist_safe = 2.0      # 离起点/终点的最小距离
+        min_dist_safe = 3.0      # 离起点/终点的最小距离
+        min_obs_sep = 2.5        # 障碍物之间的最小中心距 (m)
+        sep2 = min_obs_sep * min_obs_sep
+
+        # Only consider obstacles that are not in "limbo" (e.g. (999, 999)).
+        # Fast rule: x < 900 indicates a valid obstacle.
+        limbo_x_th = 900.0
+
+        # Precompute upper-triangular mask for S1 strategy (only resample j where j>i).
+        triu_mask = torch.triu(
+            torch.ones((num_obs, num_obs), device=self._device, dtype=torch.bool),
+            diagonal=1,
+        ).unsqueeze(0)  # (1, num_obs, num_obs)
 
         for _ in range(max_iterations):
             # A. 检查与 Start/Target 的距离
@@ -881,6 +980,18 @@ class CaptureXYTask(Core):
             d_target = torch.norm(obs_centers - target_pos.unsqueeze(1), dim=-1)
             
             mask_invalid = (d_start < min_dist_safe) | (d_target < min_dist_safe)
+
+            # B. 检查障碍物之间的最小间距 (pairwise)
+            # S1: only resample the obstacle with the larger index in each conflicting pair.
+            valid_obs = obs_centers[..., 0] < limbo_x_th  # (N, num_obs)
+            if valid_obs.any():
+                delta = obs_centers.unsqueeze(2) - obs_centers.unsqueeze(1)  # (N, num_obs, num_obs, 2)
+                dist2 = (delta * delta).sum(dim=-1)  # (N, num_obs, num_obs)
+                pair_valid = valid_obs.unsqueeze(2) & valid_obs.unsqueeze(1)
+                conflicts_upper = (dist2 < sep2) & pair_valid & triu_mask
+                # Mark j if it conflicts with any i<j.
+                invalid_sep = conflicts_upper.any(dim=1)
+                mask_invalid = mask_invalid | invalid_sep
             
             if not mask_invalid.any():
                 break # 全部合法，提前退出
@@ -898,6 +1009,16 @@ class CaptureXYTask(Core):
         d_start = torch.norm(obs_centers - start_pos.unsqueeze(1), dim=-1)
         d_target = torch.norm(obs_centers - target_pos.unsqueeze(1), dim=-1)
         final_mask_invalid = (d_start < min_dist_safe) | (d_target < min_dist_safe)
+
+        # Final pass: also invalidate obstacles that still violate min_obs_sep.
+        valid_obs = obs_centers[..., 0] < limbo_x_th
+        if valid_obs.any():
+            delta = obs_centers.unsqueeze(2) - obs_centers.unsqueeze(1)
+            dist2 = (delta * delta).sum(dim=-1)
+            pair_valid = valid_obs.unsqueeze(2) & valid_obs.unsqueeze(1)
+            conflicts_upper = (dist2 < sep2) & pair_valid & triu_mask
+            invalid_sep = conflicts_upper.any(dim=1)
+            final_mask_invalid = final_mask_invalid | invalid_sep
         
         if final_mask_invalid.any():
             print(f"Warning: {final_mask_invalid.sum()} obstacles removed due to placement conflict.")

@@ -47,6 +47,8 @@ sysid:
   action_mlp_ckpt: ''
   # Optional: loopz PPO full_*.pt dict checkpoint for teacher z* comparison
   teacher_ckpt: ''
+  # Comparison switch: if True, replace inferred latent with zeros (ablation)
+  zero_latent: False
   # Print latent mean/std and delta norms
   print_latent_stats: True
   # History length used by id_encoder

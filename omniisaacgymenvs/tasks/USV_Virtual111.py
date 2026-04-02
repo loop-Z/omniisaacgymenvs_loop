@@ -125,6 +125,12 @@ class USVVirtual(RLTask):
         self._mass_obs_mode = _mass_cfg.get("mass_obs_mode", "raw")
         self._com_obs_mode = _mass_cfg.get("com_obs_mode", "raw")
         self._com_obs_scale = _mass_cfg.get("com_obs_scale", None)
+        # 观测侧：mass/CoM 的来源（sim=当前仿真随机化值；base=固定 base 编码值）
+        self._masscom_obs_source = str(_mass_cfg.get("masscom_obs_source", "sim"))
+        if self._masscom_obs_source not in ("sim", "base"):
+            raise ValueError(
+                f"mass.masscom_obs_source must be 'sim' or 'base', got {self._masscom_obs_source}"
+            )
         if self._com_obs_mode == "scaled" and self._com_obs_scale is None:
             # 默认按船体几何尺度归一化（避免 CoM 的数值尺度压制其他观测）
             self._com_obs_scale = [
@@ -167,6 +173,12 @@ class USVVirtual(RLTask):
 
         self.actions = torch.zeros(
             (self._num_envs, self._max_actions),
+            device=self._device,
+            dtype=torch.float32,
+        )
+        # One-step action history (raw policy thrust commands in [-1, 1] before noise/clamp).
+        self.prev_thrust_cmds = torch.zeros(
+            (self._num_envs, self._num_actions),
             device=self._device,
             dtype=torch.float32,
         )
@@ -398,13 +410,24 @@ class USVVirtual(RLTask):
     def get_observations(self) -> Dict[str, torch.Tensor]:
         self.update_state()
         # TODO:获取质量信息 
-        mass, com = self.MDD.get_masses(
-            mass_obs_mode=self._mass_obs_mode,
-            com_obs_mode=self._com_obs_mode,
-            com_scale=self._com_obs_scale,
-        )  # 获取质量和质心信息
+        if self._masscom_obs_source == "base":
+            mass, com = self.MDD.get_base_masses(
+                mass_obs_mode=self._mass_obs_mode,
+                com_obs_mode=self._com_obs_mode,
+                com_scale=self._com_obs_scale,
+            )
+        else:
+            mass, com = self.MDD.get_masses(
+                mass_obs_mode=self._mass_obs_mode,
+                com_obs_mode=self._com_obs_mode,
+                com_scale=self._com_obs_scale,
+            )  # 获取质量和质心信息
         self.obs_buf["state"] = self.task.get_state_observations(
-            self.current_state, self._observation_frame, mass, com
+            self.current_state,
+            self._observation_frame,
+            mass,
+            com,
+            prev_action=self.prev_thrust_cmds,
         )
         observations = {self._heron.name: {"obs_buf": self.obs_buf}}
         return observations
@@ -429,6 +452,11 @@ class USVVirtual(RLTask):
         # 抛出未实现错误，对于其他动作类型
         else:
             raise NotImplementedError("")
+
+        # Cache prev_action for next observation (raw command, before noise/clamp).
+        self.prev_thrust_cmds[:, :] = thrust_cmds
+        if len(reset_env_ids) > 0:
+            self.prev_thrust_cmds[reset_env_ids, :] = 0.0
         # 将推力命令赋值给推力变量
         thrusts = thrust_cmds
         # 在推力上添加噪声扰动
@@ -684,6 +712,10 @@ class USVVirtual(RLTask):
         # Bookkeeping
         self.reset_buf[env_ids] = 0
         self.progress_buf[env_ids] = 0
+
+        # Reset one-step action history.
+        if hasattr(self, "prev_thrust_cmds"):
+            self.prev_thrust_cmds[env_ids, :] = 0.0
         # Fill `extras`
         self.extras["episode"] = {}
         for key in self.episode_sums.keys():

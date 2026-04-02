@@ -401,7 +401,7 @@ class USVSysIDVecEnv(USVRaisimVecEnv):
         *,
         history_len: int = 50,
         priv_dim: int = 4,
-        fill_history_on_reset: str = "repeat",
+        fill_history_on_reset: str = "zeros",
         reward_info_size: int = 16,
         device: Optional[Union[str, torch.device]] = None,
     ) -> None:

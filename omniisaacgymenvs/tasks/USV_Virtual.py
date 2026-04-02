@@ -40,7 +40,7 @@ from omniisaacgymenvs.envs.USV.ThrusterDynamics import *
 from omni.isaac.core.utils.torch.rotations import *
 from omni.isaac.core.utils.prims import get_prim_at_path
 
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import omni
@@ -93,6 +93,96 @@ class USVVirtual(RLTask):
             f"{name}; shape={tuple(tensor.shape)}; dtype={tensor.dtype}; "
             f"nan={nan_count} inf={inf_count}; finite_min={vmin} finite_max={vmax}; bad_env_ids={bad_env_ids}"
         )
+
+    def _sample_k_iz(self, n: int) -> torch.Tensor:
+        """Sample k_Iz for n envs. Returns shape (n, 1) torch tensor on self._device."""
+        if n <= 0:
+            return torch.ones((0, 1), device=self._device, dtype=torch.float32)
+        kmin = float(self._k_iz_min)
+        kmax = float(self._k_iz_max)
+        if kmin <= 0.0 or kmax <= 0.0:
+            raise ValueError(f"k_Iz_min/max must be > 0, got {kmin}, {kmax}")
+        if kmax < kmin:
+            raise ValueError(f"k_Iz_max must be >= k_Iz_min, got {kmin}, {kmax}")
+
+        u = torch.rand((n, 1), device=self._device, dtype=torch.float32)
+        if self._k_iz_sample_space == "log":
+            log_min = torch.log(torch.tensor(kmin, device=self._device, dtype=torch.float32))
+            log_max = torch.log(torch.tensor(kmax, device=self._device, dtype=torch.float32))
+            return torch.exp(log_min + u * (log_max - log_min))
+        return kmin + u * (kmax - kmin)
+
+    def _maybe_init_base_inertias0(self) -> None:
+        """Cache the current rigid-body inertia matrices as baseline (Iz0 source).
+
+        Uses RigidPrimView.get_inertias() (PhysX/physics view) when available.
+        This is invoked lazily during reset while the simulation is playing.
+        """
+        if self._base_inertias0 is not None:
+            return
+        try:
+            inertias = self._heron.base.get_inertias(clone=True)
+        except Exception:
+            inertias = None
+        if inertias is None:
+            return
+        if not torch.is_tensor(inertias):
+            inertias = torch.tensor(inertias, device=self._device, dtype=torch.float32)
+        self._base_inertias0 = inertias.clone()
+        try:
+            self.Iz0 = float(self._base_inertias0[0, 8].item())
+        except Exception:
+            self.Iz0 = None
+
+    def _apply_yaw_inertia_randomization(
+        self, env_ids: torch.Tensor, num_resets: int
+    ) -> None:
+        """Apply episode-wise k_Iz scaling to Izz via RigidPrimView.set_inertias."""
+        if not self._use_yaw_inertia_randomization:
+            return
+
+        # Base inertias should be cached from the *startup* (pre-randomization) state.
+        # We attempt to cache early in reset_idx() before mass randomization; this is a fallback.
+        self._maybe_init_base_inertias0()
+        if self._base_inertias0 is None:
+            # Physics view not ready yet; skip quietly.
+            if not getattr(self, "_yaw_inertia_init_warned", False):
+                self._yaw_inertia_init_warned = True
+                print(
+                    "[USV] yaw inertia randomization enabled, but base inertias are not available yet; "
+                    "skipping Iz writeback until physics view is ready."
+                )
+            return
+
+        k = self._sample_k_iz(num_resets)
+        self.k_Iz[env_ids, :] = k
+
+        # Compute target Izz = Iz0 * k_Iz (Iz0 taken from cached base inertia tensor).
+        base_izz = self._base_inertias0[env_ids, 8]
+        target_izz = base_izz * k.squeeze(-1)
+
+        # Preserve other inertia entries by starting from the *current* inertia (post mass/CoM updates).
+        try:
+            cur_inertias = self._heron.base.get_inertias(indices=env_ids, clone=True)
+        except Exception:
+            cur_inertias = None
+
+        if cur_inertias is None:
+            cur_inertias = self._base_inertias0[env_ids].clone()
+        elif not torch.is_tensor(cur_inertias):
+            cur_inertias = torch.tensor(cur_inertias, device=self._device, dtype=torch.float32)
+
+        new_inertias = cur_inertias.clone()
+        new_inertias[:, 8] = target_izz
+
+        # Write back through RigidPrimView batch API.
+        try:
+            self._heron.base.set_inertias(new_inertias, indices=env_ids)
+        except Exception as e:
+            if not getattr(self, "_yaw_inertia_set_warned", False):
+                self._yaw_inertia_set_warned = True
+                print(f"[USV] yaw inertia set_inertias failed once; skipping inertia writeback. err={e}")
+
     def __init__(
         self,
         name: str,
@@ -112,6 +202,36 @@ class USVVirtual(RLTask):
 
 
         self._max_episode_length = self._task_cfg["env"]["maxEpisodeLength"]
+        # Evaluation helper: when enabled, episodes only terminate on fixed horizon.
+        # This prevents async per-env early terminations (success/collision/distance) from
+        # desynchronizing scenario RNG consumption across runs.
+        env_cfg = self._task_cfg.get("env", {})
+        self._fixed_horizon_eval = bool(
+            env_cfg.get("fixed_horizon_eval", env_cfg.get("fixedHorizonEval", False))
+        )
+
+        # ---------------- Scene replay (NPZ) ----------------
+        # Default disabled => preserve current random scene generation.
+        scene_replay_cfg = env_cfg.get("scene_replay", {}) or {}
+        self.scene_replay_enabled = bool(scene_replay_cfg.get("enabled", False))
+        self.scene_replay_npz_path = str(scene_replay_cfg.get("npz_path", "") or "")
+        self.scene_replay_start_index = int(scene_replay_cfg.get("start_index", 0) or 0)
+        self.scene_replay_cycle = bool(scene_replay_cfg.get("cycle", True))
+        self.scene_replay_strict_hash = bool(scene_replay_cfg.get("strict_hash", True))
+
+        # Runtime replay state (populated lazily).
+        self._scene_replay_npz_data: Optional[Dict[str, np.ndarray]] = None
+        self.scene_replay_num_scenes: int = 0
+        # Exposed for play scripts / logging.
+        self.scene_replay_last_scene_idx = torch.full(
+            (self._num_envs,), -1, dtype=torch.long, device="cpu"
+        )
+        self._scene_replay_next_scene_idx = torch.full(
+            (self._num_envs,), self.scene_replay_start_index, dtype=torch.long, device="cpu"
+        )
+        # ---------------- Scene replay (NPZ) ----------------
+        
+
         self._discrete_actions = self._task_cfg["env"]["action_mode"]
         self._observation_frame = self._task_cfg["env"]["observation_frame"]
         self._device = self._cfg["sim_device"]
@@ -146,6 +266,26 @@ class USVVirtual(RLTask):
         self.MDD = MassDistributionDisturbances(
             self._task_cfg["env"]["disturbances"]["mass"], self.num_envs, self._device
         )
+
+        # Yaw inertia (Iz) randomization (episode-wise scalar) applied via RigidPrimView.set_inertias.
+        _inertia_cfg = self._task_cfg["env"]["disturbances"].get("inertia", {})
+        self._use_yaw_inertia_randomization = bool(
+            _inertia_cfg.get("use_yaw_inertia_randomization", False)
+        )
+        self._k_iz_min = float(_inertia_cfg.get("k_Iz_min", 1.0))
+        self._k_iz_max = float(_inertia_cfg.get("k_Iz_max", 1.0))
+        self._k_iz_sample_space = str(_inertia_cfg.get("k_Iz_sample_space", "linear"))
+        if self._k_iz_sample_space not in ("linear", "log"):
+            raise ValueError(
+                f"k_Iz_sample_space must be 'linear' or 'log', got {self._k_iz_sample_space}"
+            )
+        self.k_Iz = torch.ones(
+            (self._num_envs, 1), device=self._device, dtype=torch.float32
+        )
+        self._base_inertias0 = None  # torch.Tensor shape (num_envs, 9)
+        self.Iz0 = None  # float cached from base inertias
+        self._yaw_inertia_init_warned = False
+        self._yaw_inertia_set_warned = False
         self.dt = self._task_cfg["sim"]["dt"]
         task_cfg = self._task_cfg["env"]["task_parameters"]
         reward_cfg = self._task_cfg["env"]["reward_parameters"]
@@ -176,6 +316,12 @@ class USVVirtual(RLTask):
         self._mass_obs_mode = _mass_cfg.get("mass_obs_mode", "raw")
         self._com_obs_mode = _mass_cfg.get("com_obs_mode", "raw")
         self._com_obs_scale = _mass_cfg.get("com_obs_scale", None)
+        # 观测侧：mass/CoM 的来源（sim=当前仿真随机化值；base=固定 base 编码值）
+        self._masscom_obs_source = str(_mass_cfg.get("masscom_obs_source", "sim"))
+        if self._masscom_obs_source not in ("sim", "base"):
+            raise ValueError(
+                f"mass.masscom_obs_source must be 'sim' or 'base', got {self._masscom_obs_source}"
+            )
         if self._com_obs_mode == "scaled" and self._com_obs_scale is None:
             # 默认按船体几何尺度归一化（避免 CoM 的数值尺度压制其他观测）
             self._com_obs_scale = [
@@ -218,6 +364,13 @@ class USVVirtual(RLTask):
 
         self.actions = torch.zeros(
             (self._num_envs, self._max_actions),
+            device=self._device,
+            dtype=torch.float32,
+        )
+        # One-step action history (written into obs as prev_action).
+        # IMPORTANT: store raw policy thrust commands in [-1, 1] before any bias/noise/clamp.
+        self.prev_thrust_cmds = torch.zeros(
+            (self._num_envs, self._num_actions),
             device=self._device,
             dtype=torch.float32,
         )
@@ -482,13 +635,24 @@ class USVVirtual(RLTask):
     def get_observations(self) -> Dict[str, torch.Tensor]:
         self.update_state()
         # TODO:获取质量信息 
-        mass, com = self.MDD.get_masses(
-            mass_obs_mode=self._mass_obs_mode,
-            com_obs_mode=self._com_obs_mode,
-            com_scale=self._com_obs_scale,
-        )  # 获取质量和质心信息
+        if self._masscom_obs_source == "base":
+            mass, com = self.MDD.get_base_masses(
+                mass_obs_mode=self._mass_obs_mode,
+                com_obs_mode=self._com_obs_mode,
+                com_scale=self._com_obs_scale,
+            )
+        else:
+            mass, com = self.MDD.get_masses(
+                mass_obs_mode=self._mass_obs_mode,
+                com_obs_mode=self._com_obs_mode,
+                com_scale=self._com_obs_scale,
+            )  # 获取质量和质心信息
         self.obs_buf["state"] = self.task.get_state_observations(
-            self.current_state, self._observation_frame, mass, com
+            self.current_state,
+            self._observation_frame,
+            mass,
+            com,
+            prev_action=self.prev_thrust_cmds,
         )
         observations = {self._heron.name: {"obs_buf": self.obs_buf}}
         return observations
@@ -514,6 +678,11 @@ class USVVirtual(RLTask):
         else:
             raise NotImplementedError("")
         
+        # Cache prev_action for next observation (raw policy command, before any processing).
+        self.prev_thrust_cmds[:, :] = thrust_cmds
+        if len(reset_env_ids) > 0:
+            self.prev_thrust_cmds[reset_env_ids, :] = 0.0
+
         thrusts = thrust_cmds
 
         # Early-training fixed bias: u0=0.2 -> a0=-0.6.
@@ -671,10 +840,19 @@ class USVVirtual(RLTask):
 
     def is_done(self) -> None:
         ones = torch.ones_like(self.reset_buf)
+        # Always call task termination logic so it can update per-episode outcome buffers
+        # (e.g., success/collision flags), even if we decide not to terminate early.
         die = self.task.update_kills(self.step, self.current_state)
-        self.reset_buf[:] = torch.where(
-            self.progress_buf >= self._max_episode_length - 1, ones, die
-        )
+
+        if self._fixed_horizon_eval:
+            zeros = torch.zeros_like(self.reset_buf)
+            self.reset_buf[:] = torch.where(
+                self.progress_buf >= self._max_episode_length - 1, ones, zeros
+            )
+        else:
+            self.reset_buf[:] = torch.where(
+                self.progress_buf >= self._max_episode_length - 1, ones, die
+            )
 
 
 
@@ -765,6 +943,175 @@ class USVVirtual(RLTask):
         #     for i in range(self.big):
         #         print(f"Set_targets: Blue Pin {i} Position for Env 0: {blue_pin_positions[idx, i, :].cpu().numpy()}")
 
+    # ---------------- Scene replay (NPZ) ----------------
+    def _scene_replay_load_npz(self) -> None:
+        if not self.scene_replay_enabled:
+            return
+        if self._scene_replay_npz_data is not None:
+            return
+        if not self.scene_replay_npz_path:
+            raise ValueError("scene_replay.enabled=True but scene_replay.npz_path is empty")
+
+        npz_path = self.scene_replay_npz_path
+        if not os.path.isabs(npz_path):
+            npz_path = os.path.abspath(npz_path)
+        if not os.path.exists(npz_path):
+            raise FileNotFoundError(f"scene_replay.npz_path not found: {npz_path}")
+
+        required = [
+            "obstacles_xy",
+            "obstacles_count",
+            "start_pos",
+            "start_yaw",
+            "start_vel",
+            "goal_pos",
+        ]
+        with np.load(npz_path, allow_pickle=True) as npz:
+            missing = [k for k in required if k not in npz.files]
+            if missing:
+                raise KeyError(
+                    f"scene_replay npz missing keys={missing}; found={list(npz.files)}"
+                )
+
+            data: Dict[str, np.ndarray] = {}
+            for k in required:
+                data[k] = np.array(npz[k])
+
+        n = int(data["start_pos"].shape[0])
+        if n <= 0:
+            raise ValueError(f"scene_replay npz has no scenes: start_pos.shape={data['start_pos'].shape}")
+
+        self._scene_replay_npz_data = data
+        self.scene_replay_num_scenes = n
+        # Update path to absolute for downstream users.
+        self.scene_replay_npz_path = npz_path
+
+
+    def _scene_replay_take_scene_indices(self, env_ids: torch.Tensor) -> torch.Tensor:
+        """Allocate a scene index for each env in env_ids and advance its counter."""
+
+        self._scene_replay_load_npz()
+        if self._scene_replay_npz_data is None or self.scene_replay_num_scenes <= 0:
+            raise RuntimeError("scene replay npz not loaded")
+
+        env_cpu = env_ids.detach().cpu().long()
+        idx = self._scene_replay_next_scene_idx[env_cpu].clone()
+        self._scene_replay_next_scene_idx[env_cpu] = idx + 1
+
+        if self.scene_replay_cycle:
+            idx = idx % int(self.scene_replay_num_scenes)
+        else:
+            if bool((idx < 0).any()) or bool((idx >= int(self.scene_replay_num_scenes)).any()):
+                raise IndexError(
+                    f"scene_replay index out of range: idx={idx.tolist()} num_scenes={self.scene_replay_num_scenes}"
+                )
+
+        self.scene_replay_last_scene_idx[env_cpu] = idx
+        return idx
+
+
+    def _scene_replay_apply(self, env_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Apply NPZ scene to task buffers and return (root_pos, root_rot, root_velocities) full tensors."""
+
+        self._scene_replay_load_npz()
+        assert self._scene_replay_npz_data is not None
+
+        idx_cpu = self._scene_replay_take_scene_indices(env_ids)
+        idx_np = idx_cpu.numpy().astype(np.int64, copy=False)
+
+        data = self._scene_replay_npz_data
+
+        start_pos = np.asarray(data["start_pos"], dtype=np.float32)[idx_np, :2]
+        start_yaw = np.asarray(data["start_yaw"], dtype=np.float32)[idx_np].reshape(-1)
+        start_vel = np.asarray(data["start_vel"], dtype=np.float32)[idx_np, :2]
+        goal_pos = np.asarray(data["goal_pos"], dtype=np.float32)[idx_np, :2]
+        obstacles_xy = np.asarray(data["obstacles_xy"], dtype=np.float32)[idx_np]
+        if obstacles_xy.ndim == 3 and obstacles_xy.shape[-1] >= 2:
+            obstacles_xy = obstacles_xy[..., :2]
+        obstacles_count = np.asarray(data["obstacles_count"], dtype=np.int64)[idx_np].reshape(-1)
+
+        # Torch tensors for this reset batch
+        start_pos_t = torch.from_numpy(start_pos).to(device=self._device, dtype=torch.float32)
+        start_yaw_t = torch.from_numpy(start_yaw).to(device=self._device, dtype=torch.float32)
+        start_vel_t = torch.from_numpy(start_vel).to(device=self._device, dtype=torch.float32)
+        goal_pos_t = torch.from_numpy(goal_pos).to(device=self._device, dtype=torch.float32)
+        obstacles_xy_t = torch.from_numpy(np.asarray(obstacles_xy, dtype=np.float32)).to(
+            device=self._device, dtype=torch.float32
+        )
+        obstacles_count_t = torch.from_numpy(obstacles_count).to(device=self._device, dtype=torch.long)
+
+        # Apply to inner task semantic buffers (goal + obstacles + potential field)
+        if not hasattr(self.task, "apply_scene"):
+            raise AttributeError("Inner task does not implement apply_scene(); cannot use scene_replay")
+        self.task.apply_scene(
+            env_ids,
+            obstacles_xy_local=obstacles_xy_t,
+            obstacles_count=obstacles_count_t,
+            goal_xy_local=goal_pos_t,
+        )
+
+        # Build full reset tensors (shape [num_envs, ...]) to match get_spawns() contract.
+        root_pos = self.initial_root_pos.clone()
+        root_rot = self.initial_root_rot.clone()
+
+        env_long = env_ids.long()
+        env_origin_xy = self._env_pos[env_long, :2]
+        root_pos[env_long, :2] = env_origin_xy + start_pos_t
+        root_pos[env_long, 2] = self.heron_zero_height + (
+            -1 * self.heron_mass / (self.waterplane_area * self.water_density)
+        )
+
+        # Yaw-only quaternion in (w,x,y,z)
+        half = 0.5 * start_yaw_t
+        root_rot[env_long, :] = 0.0
+        root_rot[env_long, 0] = torch.cos(half)
+        root_rot[env_long, 3] = torch.sin(half)
+
+        root_velocities = self.root_velocities.clone()
+        root_velocities[env_long, :] = 0.0
+        root_velocities[env_long, 0] = start_vel_t[:, 0]
+        root_velocities[env_long, 1] = start_vel_t[:, 1]
+
+        return root_pos, root_rot, root_velocities
+
+
+    def _sync_markers_from_task_buffers(self, env_ids: torch.Tensor) -> None:
+        """Sync marker prim views from task buffers without re-randomizing goals."""
+
+        if env_ids is None or len(env_ids) == 0:
+            return
+
+        env_long = env_ids.long()
+        num_sets = int(env_long.numel())
+
+        # Red goal marker uses world origin + local target offset
+        target_positions = self.initial_pin_pos.clone()
+        target_positions[env_long, :2] += self.task._target_positions[env_long]
+        target_positions[env_long, 2] = torch.ones(num_sets, device=self._device) * 2.0
+
+        target_orientation = self.initial_pin_rot.clone()
+
+        if self._marker:
+            self._marker.set_world_poses(
+                target_positions[env_long],
+                target_orientation[env_long],
+                indices=env_long,
+            )
+
+        self.target_positions = target_positions
+        self.target_orientation = target_orientation
+
+        # Blue obstacle markers use task-provided world positions
+        blue_pin_positions = self.task._blue_pin_positions[env_long]
+        blue_pin_orientations = target_orientation[env_long].unsqueeze(1).repeat(1, self.big, 1)
+        for i in range(self.big):
+            if self._blue_markers[i]:
+                self._blue_markers[i].set_world_poses(
+                    blue_pin_positions[:, i, :],
+                    blue_pin_orientations[:, i, :],
+                    indices=env_long,
+                )
+        # ---------------- Scene replay (NPZ) ----------------
 
 
 
@@ -787,34 +1134,48 @@ class USVVirtual(RLTask):
         self.task.reset(env_ids)
         self.UF.generate_force(env_ids, num_resets)
         self.TD.generate_torque(env_ids, num_resets)
+
+        # Cache baseline inertias (Iz0 source) BEFORE any sim randomization touches mass/CoM.
+        # This matches the requirement: Iz0 comes from startup/base_link PhysX state.
+        if self._use_yaw_inertia_randomization:
+            self._maybe_init_base_inertias0()
+
         self.MDD.randomize_masses(env_ids, num_resets)
         self.MDD.set_masses(self._heron.base, env_ids)
+
+        # Apply yaw inertia randomization after masses are updated.
+        self._apply_yaw_inertia_randomization(env_ids, num_resets)
         self.hydrodynamics.reset_coefficients(env_ids, num_resets)
         self.thrusters_dynamics.reset_thruster_randomization(env_ids, num_resets)
-        # Randomizes the starting position of the platform within a disk around the target
-        root_pos, root_rot = self.task.get_spawns(
-            env_ids,
-            self.initial_root_pos.clone(),
-            self.initial_root_rot.clone(),
-            self.step,
-        )
-        root_pos[:, 2] = self.heron_zero_height + (
-            -1 * self.heron_mass / (self.waterplane_area * self.water_density)
-        )
+        # Random scene generation (default) vs deterministic NPZ scene replay.
+        if self.scene_replay_enabled:
+            root_pos, root_rot, root_velocities = self._scene_replay_apply(env_ids)
+        else:
+            # Randomizes the starting position of the platform within a disk around the target
+            root_pos, root_rot = self.task.get_spawns(
+                env_ids,
+                self.initial_root_pos.clone(),
+                self.initial_root_rot.clone(),
+                self.step,
+            )
+            root_pos[:, 2] = self.heron_zero_height + (
+                -1 * self.heron_mass / (self.waterplane_area * self.water_density)
+            )
         # Resets the states of the joints
         self.dof_pos[env_ids, :] = torch.zeros(
             (num_resets, self._heron.num_dof), device=self._device
         )
         self.dof_vel[env_ids, :] = 0
-        # Sets the velocities to 0
-        root_velocities = self.root_velocities.clone()
-        root_velocities[env_ids] = 0
-        root_velocities[env_ids, 0] = (
-            torch.rand(num_resets, device=self._device) * 3 - 1.5
-        )
-        root_velocities[env_ids, 1] = (
-            torch.rand(num_resets, device=self._device) * 3 - 1.5
-        )
+        # Sets the velocities to 0 (or replay from npz)
+        if not self.scene_replay_enabled:
+            root_velocities = self.root_velocities.clone()
+            root_velocities[env_ids] = 0
+            root_velocities[env_ids, 0] = (
+                torch.rand(num_resets, device=self._device) * 3 - 1.5
+            )
+            root_velocities[env_ids, 1] = (
+                torch.rand(num_resets, device=self._device) * 3 - 1.5
+            )
         # Apply resets
         self._heron.set_joint_positions(self.dof_pos[env_ids], indices=env_ids)
         self._heron.set_joint_velocities(self.dof_vel[env_ids], indices=env_ids)
@@ -825,6 +1186,10 @@ class USVVirtual(RLTask):
         # Bookkeeping
         self.reset_buf[env_ids] = 0
         self.progress_buf[env_ids] = 0
+
+        # Reset one-step action history.
+        if hasattr(self, "prev_thrust_cmds"):
+            self.prev_thrust_cmds[env_ids, :] = 0.0
 
         # Inject per-episode outcome events into episode_sums so they get logged.
         if "success" in self.episode_sums:
@@ -858,8 +1223,12 @@ class USVVirtual(RLTask):
                 self.extras["episode"][key],
             )
             self.episode_sums[key][env_ids] = 0.0
-        # Explicitly call set_targets to ensure blue pin positions are updated
-        self.set_targets(env_ids)
+        # Sync markers: replay must not call set_targets() (it re-randomizes goals)
+        if self.scene_replay_enabled:
+            self._sync_markers_from_task_buffers(env_ids)
+        else:
+            # Explicitly call set_targets to ensure blue pin positions are updated
+            self.set_targets(env_ids)
         # Print positions for the first environment
 
 

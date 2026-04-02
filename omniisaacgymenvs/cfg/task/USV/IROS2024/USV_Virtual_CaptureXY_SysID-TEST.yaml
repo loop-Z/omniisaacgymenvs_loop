@@ -22,6 +22,43 @@ env:
   clipObservations: {state: 12.0}
   clipActions: 1.0
 
+  # Play/eval-mode knobs (used by scripts/rlgames_play_loopz.py)
+  # Enable by CLI override, e.g.
+  #   task.env.eval.enabled=True task.env.eval.num_episodes=200
+  eval:
+    enabled: False
+    # Episodes per mode. If modes has 2 entries, total episodes = num_episodes * len(modes).
+    num_episodes: 200
+    # Which observation modes to evaluate in one run.
+    # - If empty/omitted: uses disturbances.mass.masscom_obs_source.
+    # - Typical A/B: ["sim", "base"]
+    modes: [base]
+    # CSV output path. Empty => auto under runs/play_CSV/<timestamp>.csv
+    output_csv: ""
+    # Whether to print per-step logs during eval (episode summary always prints)
+    print_steps: True
+
+  # Fixed-scene replay (NPZ) for controlled A/B comparisons.
+  # Default disabled => preserves current random scene generation.
+  scene_replay:
+    enabled: False
+    # Path to scenario table produced by scripts/build_usv_scenes.py
+    # Example: runs/usv_scenarios/<TS>/USVVirtual__scenes__N200__seed1234.npz
+    npz_path: ""
+    # First scenario index to use.
+    start_index: 0
+    # If True, wrap around when reaching the end (recommended for long play runs).
+    cycle: False
+    # If True, rlgames_play_loopz_compare.py will fail-fast when npz_hash != sim_hash.
+    strict_hash: True
+  # ---------------- Scene replay (NPZ) ----------------
+
+
+  # If True, environment termination is fixed-horizon only (maxEpisodeLength).
+  # The task can still compute success/collision flags for logging, but resets won't
+  # happen early. This is recommended for fair A/B comparisons with numEnvs>1.
+  fixed_horizon_eval: False
+
   action_processing:
     use_affine_thrust_mapping: True
     initial_action_bias: -0.6
@@ -88,7 +125,7 @@ env:
       # Add mass randomization
       add_mass_disturbances: True  ###########################True
       min_mass: 34.96
-      max_mass: 38.96             # 36.96
+      max_mass: 54.96                  #38.96             # 36.96
       # Legacy (backward compatible): CoM randomization radius in the XY plane (meters).
       # If `com_displacement_xyz` is provided, the code will use that instead.
       # Note: legacy mode keeps Z unchanged (dz = 0).
@@ -97,14 +134,17 @@ env:
       # New (recommended): anisotropic bounded CoM randomization in meters (body frame)
       # More variation along length (x), less along width/height (y/z)
       com_displacement_xyz: [0.15, 0.05, 0.02]  # max random displacement along x, y, z from the base CoM
+      # com_displacement_xyz: [0.15, 0.10, 0.05]  # max random displacement along x, y, z from the base CoM
       base_com: [0.0, 0.0, 0.0]
       apply_com_to_sim: True
 
       # Observation-side encoding (keeps dynamics values unchanged)
       # - mass_obs_mode: raw | relative   (relative = (m - base_mass) / base_mass)
       # - com_obs_mode : raw | scaled     (scaled = com / com_obs_scale)
+      # - masscom_obs_source: sim | base  (sim = feed current randomized values; base = feed fixed base-encoded values)
       mass_obs_mode: relative
       com_obs_mode: scaled
+      masscom_obs_source: base     #base or sim
 
     drag:
       # Add drag disturbances
@@ -125,21 +165,41 @@ env:
       p_quad_rand: 0.0 # Roll. In 2D, neglectable
       q_quad_rand: 0.0 # Pitch. In 2D, neglectable
       r_quad_rand: 0.1 # Yaw
+
+      # Overall drag/damping scale randomization (episode-wise scalar)
+      # When enabled, multiplies the *entire* damping matrix (linear + quadratic)
+      # by k_drag per environment. This is independent of (and can be combined with)
+      # the per-coefficient noise above.
+      use_drag_scale_randomization: True
+      k_drag_min: 1.0
+      k_drag_max: 1.8
+      k_drag_sample_space: linear  # linear | log
     
     thruster:
       # Add thruster disturbances
-      use_thruster_randomization: False  ###########################True
+      use_thruster_randomization: True  ###########################True
       thruster_rand: 0.5 # If it is 0.2 it means 0.8 to 1.2
       use_separate_randomization: False
       left_rand: 0.5 # If it is 0.2 it means 0.8 to 1.2
       right_rand: 0.5 # If it is 0.2 it means 0.8 to 1.2
 
+    inertia:
+      # Yaw inertia (Iz) scale randomization (episode-wise scalar)
+      # Applies to the base_link rigid body's inertia matrix via RigidPrimView.set_inertias.
+      use_yaw_inertia_randomization: True
+      k_Iz_min: 1.0
+      k_Iz_max: 1.8
+      k_Iz_sample_space: linear  # linear | log
+
   task_parameters: 
     name: CaptureXY  # CaptureXY
     position_tolerance: 1.0 # 0.1 default
     kill_after_n_steps_in_tolerance: 1 # 1 means kill after arriving at the goal
-    max_spawn_dist: 10.0
-    min_spawn_dist: 6.0
+    # max_spawn_dist: 10.0
+    # min_spawn_dist: 6.0
+    max_spawn_dist: 12.0
+    min_spawn_dist: 9.0
+
     kill_dist: 20.0
     boundary_cost: 25.0
     goal_reward: 20.0 # Goal reward for reaching the goal

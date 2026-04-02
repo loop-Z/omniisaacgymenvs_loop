@@ -78,7 +78,12 @@ class GoToPoseTask(Core):
         return stats
 
     def get_state_observations(
-        self, current_state: dict, observation_frame: str
+        self,
+        current_state: dict,
+        observation_frame: str,
+        mass: torch.Tensor = None,
+        com: torch.Tensor = None,
+        prev_action: torch.Tensor = None,
     ) -> torch.Tensor:
         """
         Computes the observation tensor from the current state of the robot.""" ""
@@ -108,7 +113,7 @@ class GoToPoseTask(Core):
         self._task_data[:, 2] = torch.norm(self._position_error, dim=1)
         self._task_data[:, 3] = torch.cos(self._heading_error)
         self._task_data[:, 4] = torch.sin(self._heading_error)
-        return self.update_observation_tensor(current_state, observation_frame)
+        return self.update_observation_tensor(current_state, observation_frame, mass, com, prev_action)
     
 
 

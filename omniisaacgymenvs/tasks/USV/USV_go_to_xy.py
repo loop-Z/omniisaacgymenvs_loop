@@ -81,7 +81,12 @@ class GoToXYTask(Core):
         return stats
 
     def get_state_observations(
-        self, current_state: dict, observation_frame: str
+        self,
+        current_state: dict,
+        observation_frame: str,
+        mass: torch.Tensor = None,
+        com: torch.Tensor = None,
+        prev_action: torch.Tensor = None,
     ) -> torch.Tensor:
         """
         Computes the observation tensor from the current state of the robot."""
@@ -104,7 +109,7 @@ class GoToXYTask(Core):
         self._task_data[:, 2] = torch.norm(self._position_error, dim=1)
         # Debug : print the task data
         # print(f"self._task_data: {self._task_data}")
-        return self.update_observation_tensor(current_state, observation_frame)
+        return self.update_observation_tensor(current_state, observation_frame, mass, com, prev_action)
 
     def compute_reward(
         self, current_state: torch.Tensor, actions: torch.Tensor
