@@ -62,6 +62,7 @@ import csv
 import hashlib
 import math
 import os
+import re
 import time
 from typing import Any, Dict, Optional, Tuple
 
@@ -78,6 +79,13 @@ from omniisaacgymenvs.utils.config_utils.path_utils import retrieve_checkpoint_p
 from omniisaacgymenvs.utils.hydra_cfg.hydra_utils import *  # noqa: F403
 from omniisaacgymenvs.utils.hydra_cfg.reformat import omegaconf_to_dict, print_dict
 from omniisaacgymenvs.utils.task_util import initialize_task
+from omniisaacgymenvs.utils.trajectory_plot import (
+    axis_from_env,
+    axis_from_kill_dist,
+    default_traj_out_dir,
+    parse_axis,
+    save_episode_trajectory_png,
+)
 
 
 def _wrap_to_pi(angle: float) -> float:
@@ -111,6 +119,17 @@ def _env_flag(name: str, default: str = "0") -> bool:
 
     v = os.getenv(name, default)
     return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
+_FNAME_TOKEN_RE = re.compile(r"[^A-Za-z0-9_.-]+")
+
+
+def _sanitize_filename_token(v: Any) -> str:
+    s = "--" if v is None else str(v)
+    s = s.strip()
+    s = _FNAME_TOKEN_RE.sub("_", s)
+    s = s.strip("._-")
+    return s or "--"
 
 
 def _quantize_xy(xy: np.ndarray, *, quant_m: float) -> np.ndarray:
@@ -906,6 +925,26 @@ def parse_hydra_configs(cfg: DictConfig):
     eval_run_id = datetime.datetime.now().strftime("%b%d_%H-%M-%S")
     experiment_name = str(getattr(cfg.train.params.config, "name", "USV"))
 
+    # Trajectory plotting (optional): task.env.eval.traj_plot
+    traj_plot_cfg = getattr(eval_cfg, "traj_plot", None) if eval_cfg is not None else None
+    traj_plot_enabled = bool(getattr(traj_plot_cfg, "enabled", False)) if traj_plot_cfg is not None else False
+    traj_plot_enabled = _env_flag("LOOPZ_PLAY_TRAJ_PLOT", "1" if traj_plot_enabled else "0")
+
+    traj_plot_axis = None
+    try:
+        traj_plot_axis = parse_axis(getattr(traj_plot_cfg, "axis", None) if traj_plot_cfg is not None else None)
+    except Exception:
+        traj_plot_axis = None
+    if traj_plot_axis is None:
+        traj_plot_axis = axis_from_env("LOOPZ_PLAY_TRAJ_AXIS")
+
+    traj_plot_out_dir = str(getattr(traj_plot_cfg, "out_dir", "")) if traj_plot_cfg is not None else ""
+    if traj_plot_enabled and not traj_plot_out_dir:
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        traj_plot_out_dir = default_traj_out_dir(repo_root=repo_root, run_id=eval_run_id)
+    if traj_plot_enabled:
+        _mkdir_p(traj_plot_out_dir)
+
     if eval_enabled:
         if not eval_output_csv:
             # Default: always write under <repo_root>/runs/play_CSV/<timestamp>.csv
@@ -1116,6 +1155,47 @@ def parse_hydra_configs(cfg: DictConfig):
                 prev_pos = start_pos
                 path_length = 0.0
 
+                start_yaw = None
+                end_yaw = None
+                try:
+                    y0 = _to_float(m0.get("yaw"))
+                    if y0 is not None and np.isfinite(y0):
+                        start_yaw = float(y0)
+                        end_yaw = float(y0)
+                except Exception:
+                    start_yaw = None
+                    end_yaw = None
+
+                traj_xy = []
+                obstacles_xy = None
+                obstacle_radius_m = None
+                if traj_plot_enabled:
+                    try:
+                        px0 = _safe_float(m0.get("pos_x"))
+                        py0 = _safe_float(m0.get("pos_y"))
+                        if np.isfinite([px0, py0]).all():
+                            traj_xy.append((float(px0), float(py0)))
+                    except Exception:
+                        pass
+                    try:
+                        inner_task = _maybe_get_attr(base_task, "task")
+                        xunlian_pos = _maybe_get_attr(inner_task, "xunlian_pos")
+                        if torch.is_tensor(xunlian_pos) and xunlian_pos.numel() >= 2:
+                            obstacles_xy = xunlian_pos[0, :, :2].detach().cpu().numpy()
+                        gpu_map = _maybe_get_attr(inner_task, "gpu_map")
+                        obstacle_radius_m = _to_float(_maybe_get_attr(gpu_map, "obstacle_radius"))
+                        if traj_plot_axis is None:
+                            task_params = _maybe_get_attr(inner_task, "_task_parameters")
+                            kill_dist = _to_float(_maybe_get_attr(task_params, "kill_dist"))
+                            traj_plot_axis = axis_from_kill_dist(kill_dist)
+                            if traj_plot_axis is None:
+                                print(
+                                    "[loopz-play][traj_plot] missing axis; set task.env.eval.traj_plot.axis=[xmin,xmax,ymin,ymax] "
+                                    "or env LOOPZ_PLAY_TRAJ_AXIS=xmin,xmax,ymin,ymax"
+                                )
+                    except Exception:
+                        pass
+
                 prev_action0 = None
                 action_delta_sum = 0.0
                 action_delta_count = 0
@@ -1168,6 +1248,22 @@ def parse_hydra_configs(cfg: DictConfig):
                     # Metrics based on underlying task state (env0)
                     base_task = getattr(env, "_task", None)
                     m = _compute_step_metrics(base_task)
+
+                    try:
+                        yy = _to_float(m.get("yaw"))
+                        if yy is not None and np.isfinite(yy):
+                            end_yaw = float(yy)
+                    except Exception:
+                        pass
+
+                    if traj_plot_enabled:
+                        try:
+                            px_t = _safe_float(m.get("pos_x"))
+                            py_t = _safe_float(m.get("pos_y"))
+                            if np.isfinite([px_t, py_t]).all():
+                                traj_xy.append((float(px_t), float(py_t)))
+                        except Exception:
+                            pass
 
                     # Path length (env0): accumulate from position deltas
                     try:
@@ -1230,6 +1326,40 @@ def parse_hydra_configs(cfg: DictConfig):
                     obs_source = str(getattr(base_task, "_masscom_obs_source", "sim"))
                 if obs_source not in ("sim", "base"):
                     obs_source = "sim"
+
+                if traj_plot_enabled and traj_plot_axis is not None and len(traj_xy) >= 2:
+                    try:
+                        _mkdir_p(traj_plot_out_dir)
+                        result_tag = "SUCCESS" if int(success) == 1 else "FAIL"
+                        reason_tag = _sanitize_filename_token(reason)
+                        mode_tag = _sanitize_filename_token(obs_source)
+                        fname = f"ep_{int(episode_idx):04d}_{mode_tag}_{result_tag}_{reason_tag}.png"
+                        out_path = os.path.join(traj_plot_out_dir, fname)
+                        title = f"{experiment_name} {eval_run_id} ep={int(episode_idx)} mode={obs_source}"
+                        save_episode_trajectory_png(
+                            out_path=out_path,
+                            axis=traj_plot_axis,
+                            traj_xy=np.asarray(traj_xy, dtype=np.float64),
+                            start_xy=(sx, sy),
+                            goal_xy=(gx, gy),
+                            obstacles_xy=obstacles_xy,
+                            obstacle_radius_m=obstacle_radius_m,
+                            usv_length_m=1.35,
+                            usv_width_m=0.98,
+                            start_yaw_rad=start_yaw,
+                            end_yaw_rad=end_yaw,
+                            draw_usv_footprint=True,
+                            d0_m=None,
+                            title=title,
+                            success=success,
+                            reason=reason,
+                            steps=step,
+                            control_dt=control_dt,
+                            return_scaled=ep_return_scaled,
+                            path_efficiency=path_eff,
+                        )
+                    except Exception as e:
+                        print(f"[loopz-play][traj_plot] failed to save png (err={type(e).__name__}: {e})")
 
                 if not eval_enabled:
                     print(

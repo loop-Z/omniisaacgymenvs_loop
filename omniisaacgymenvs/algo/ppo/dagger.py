@@ -13,7 +13,7 @@ from .storage import ObsStorage
 class USVSysIDAgent:
     """USV sysid 版本的 DAgger/rollout agent。
 
-    - teacher latent: z* = mass_encoder(masscom)
+    - teacher latent: z* = mass_encoder(priv_tail)
     - student latent: z^ = id_encoder(history_flat)
     - action: a = frozen_action_head([obs_nonpriv, z^])
 
@@ -62,8 +62,8 @@ class USVSysIDAgent:
     def get_student_action(self, sysid_obs_torch: torch.Tensor) -> torch.Tensor:
         return self.evaluate(sysid_obs_torch)
 
-    def teacher_latent(self, masscom_torch: torch.Tensor) -> torch.Tensor:
-        return self.teacher_mass_encoder(masscom_torch)
+    def teacher_latent(self, priv_tail_torch: torch.Tensor) -> torch.Tensor:
+        return self.teacher_mass_encoder(priv_tail_torch)
 
 
 class USVSysIDTrainer:
@@ -112,11 +112,11 @@ class USVSysIDTrainer:
             actions = self.actor.get_student_action(obs_t)
         return actions.detach().cpu().numpy()
 
-    def step(self, sysid_obs_np: np.ndarray, masscom_torch: torch.Tensor) -> None:
+    def step(self, sysid_obs_np: np.ndarray, priv_tail_torch: torch.Tensor) -> None:
         """存储一条 transition 所需的监督数据：history_flat 与 teacher z*。"""
 
         with torch.no_grad():
-            z_star = self.actor.teacher_latent(masscom_torch.to(self.device, dtype=torch.float32))
+            z_star = self.actor.teacher_latent(priv_tail_torch.to(self.device, dtype=torch.float32))
             z_star = z_star[:, : self.latent_dim].detach()
 
         history_np = sysid_obs_np[:, : self.history_dim].astype(np.float32, copy=False)

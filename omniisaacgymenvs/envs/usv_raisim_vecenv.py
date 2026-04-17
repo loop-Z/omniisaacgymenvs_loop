@@ -475,6 +475,32 @@ class USVSysIDVecEnv(USVRaisimVecEnv):
             raise ValueError(f"Expected masscom shape [N,4], got {tuple(masscom_t.shape)}")
         return masscom_t
 
+    def get_priv_tail_from_obs(self, obs_full: ArrayLike) -> torch.Tensor:
+        """Extract privileged tail from a full observation.
+
+        Returns a torch tensor of shape [N, priv_dim] on self._device.
+        """
+
+        if torch.is_tensor(obs_full):
+            obs_t = obs_full.to(self._device, dtype=torch.float32)
+        elif isinstance(obs_full, np.ndarray):
+            obs_t = torch.from_numpy(obs_full).to(self._device, dtype=torch.float32)
+        else:
+            raise TypeError("obs_full must be torch.Tensor or np.ndarray")
+
+        if obs_t.ndim != 2 or obs_t.shape[1] < self.priv_dim:
+            raise ValueError(
+                f"obs_full must be [N, >=priv_dim], got {tuple(obs_t.shape)} priv_dim={self.priv_dim}"
+            )
+
+        return obs_t[:, -self.priv_dim :]
+
+    def get_priv_tail(self) -> torch.Tensor:
+        """Return the current observation privileged tail (encoded), shape [N, priv_dim]."""
+
+        obs_t = self._get_current_obs_torch()
+        return obs_t[:, -self.priv_dim :]
+
     def observe_nonpriv(self) -> np.ndarray:
         """返回去掉 priv tail 的观测：shape [N, obs_nonpriv_dim]。"""
 
@@ -522,12 +548,16 @@ class USVSysIDVecEnv(USVRaisimVecEnv):
             else:
                 raise TypeError("obs_full must be torch.Tensor, np.ndarray, or None")
 
-        if obs_t.shape[1] < self.priv_dim:
+        if obs_t.ndim != 2 or obs_t.shape[1] < self.priv_dim:
             raise ValueError(f"obs_full dim too small: {tuple(obs_t.shape)}")
 
+        # Compare only the mass+CoM portion against MDD ground-truth.
+        # When priv_dim==8, the last 4 dims are additional privileged dynamics params
+        # (k_drag, thr_L, thr_R, k_Iz) which are not returned by get_masscom().
         tail = obs_t[:, -self.priv_dim :]
         masscom = self.get_masscom()
-        diff = (tail - masscom).abs()
+        tail4 = tail[:, :4]
+        diff = (tail4 - masscom).abs()
         max_err = float(diff.max().item()) if diff.numel() > 0 else 0.0
 
         ok = max_err <= float(tol)
@@ -535,7 +565,10 @@ class USVSysIDVecEnv(USVRaisimVecEnv):
         if ok:
             return True
 
-        msg = f"[USVSysIDVecEnv] masscom consistency check failed: max_err={max_err:.3e} > tol={tol:.3e}"
+        msg = (
+            f"[USVSysIDVecEnv] masscom consistency check failed: "
+            f"max_err={max_err:.3e} > tol={tol:.3e} (checked tail[:4] vs MDD masscom)"
+        )
         if raise_on_fail:
             raise RuntimeError(msg)
         print(msg)

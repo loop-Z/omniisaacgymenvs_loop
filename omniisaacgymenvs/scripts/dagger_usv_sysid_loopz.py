@@ -144,7 +144,22 @@ def main(cfg: DictConfig):
 
     history_len = int(env_cfg.get("history_len", 50))
     speed_dim = int(env_cfg.get("speed_dim", 3))
-    mass_dim = int(env_cfg.get("mass_dim", 4))
+
+    # Privileged tail dim (legacy key: mass_dim). Prefer task.env.priv_dim/mass_dim to stay
+    # consistent with the actual environment observation protocol.
+    priv_dim_env = int(env_cfg.get("mass_dim", 4))
+    priv_dim_task = None
+    try:
+        priv_dim_task = cfg.task.env.get("priv_dim", cfg.task.env.get("mass_dim", None))
+        priv_dim_task = int(priv_dim_task) if priv_dim_task is not None else None
+    except Exception:
+        priv_dim_task = None
+    priv_dim = int(priv_dim_task) if priv_dim_task is not None else int(priv_dim_env)
+    if rank == 0 and priv_dim_task is not None and int(priv_dim_task) != int(priv_dim_env):
+        print(
+            f"[sysid][WARN] priv_dim mismatch: task.env.priv_dim/mass_dim={int(priv_dim_task)} "
+            f"but environment.mass_dim={int(priv_dim_env)} (legacy override). Using priv_dim={int(priv_dim)}."
+        )
 
     policy_net = arch_cfg.get("policy_net", [128, 128])
     activation = arch_cfg.get("activation", "tanh")
@@ -191,13 +206,13 @@ def main(cfg: DictConfig):
         env_rlg._world.step(render=False)
         env_rlg._task.update_state()
 
-    env = USVSysIDVecEnv(env_rlg, history_len=history_len, priv_dim=mass_dim)
+    env = USVSysIDVecEnv(env_rlg, history_len=history_len, priv_dim=priv_dim)
 
     # One reset to populate internal buffers.
     env.reset()
 
-    if env.num_obs <= mass_dim:
-        raise RuntimeError(f"Unexpected obs dim: num_obs={env.num_obs} mass_dim={mass_dim}")
+    if env.num_obs <= priv_dim:
+        raise RuntimeError(f"Unexpected obs dim: num_obs={env.num_obs} priv_dim={priv_dim}")
 
     obs_nonpriv_dim = env.obs_nonpriv_dim
     act_dim = env.num_acts
@@ -212,7 +227,7 @@ def main(cfg: DictConfig):
         output_activation_fn,
         small_init,
         speed_dim=speed_dim,
-        mass_dim=mass_dim,
+        mass_dim=priv_dim,
         mass_latent_dim=mass_latent_dim,
         mass_encoder_shape=mass_encoder_shape,
     ).to(device)
@@ -228,6 +243,24 @@ def main(cfg: DictConfig):
 
     teacher_mass_encoder = teacher_arch.architecture.mass_encoder
     frozen_action_head = teacher_arch.architecture.action_mlp
+
+    # ---------------- Runtime shape self-check (print-only) ----------------
+    if rank == 0:
+        try:
+            enc_in = None
+            # Try to infer mass_encoder input feature dim from its first Linear.
+            for m in teacher_mass_encoder.modules():
+                if isinstance(m, nn.Linear):
+                    enc_in = int(m.in_features)
+                    break
+            print(
+                "[sysid][shape] "
+                f"priv_dim={int(priv_dim)} obs_nonpriv_dim={int(obs_nonpriv_dim)} "
+                f"teacher_mass_encoder_in={enc_in} "
+                f"num_obs={int(env.num_obs)} act_dim={int(act_dim)} history_len={int(history_len)}"
+            )
+        except Exception as e:
+            print(f"[sysid][shape] self-check skipped/failed: {e}")
 
     # Student id encoder: history(nonpriv) -> latent
     id_encoder = ppo_module.StateHistoryEncoder(
@@ -253,7 +286,8 @@ def main(cfg: DictConfig):
     try:
         meta = {
             "history_len": history_len,
-            "mass_dim": mass_dim,
+            "priv_dim": priv_dim,
+            "mass_dim": priv_dim,
             "speed_dim": speed_dim,
             "obs_nonpriv_dim": obs_nonpriv_dim,
             "history_dim": history_dim,
@@ -301,10 +335,10 @@ def main(cfg: DictConfig):
                 first_reset_done = True
 
             sysid_obs = env.observe_sysid_obs()
-            masscom = env.get_masscom()
+            priv_tail = env.get_priv_tail()
 
             actions = trainer.observe(sysid_obs)
-            trainer.step(sysid_obs, masscom)
+            trainer.step(sysid_obs, priv_tail)
             env.step(actions)
 
             steps_collected += 1

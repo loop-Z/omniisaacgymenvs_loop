@@ -94,62 +94,6 @@ class USVVirtual(RLTask):
             f"nan={nan_count} inf={inf_count}; finite_min={vmin} finite_max={vmax}; bad_env_ids={bad_env_ids}"
         )
 
-    def _encode_centered_priv_param(
-        self,
-        x: torch.Tensor,
-        *,
-        x_min: float,
-        x_max: float,
-        nominal: float = 1.0,
-        eps: float = EPS,
-    ) -> torch.Tensor:
-        """Center-and-scale a multiplicative privileged scalar around nominal.
-
-        Output is clamped to [-1, 1] using the largest deviation from nominal:
-          y = (x - nominal) / max(|x_min-nominal|, |x_max-nominal|)
-
-        This ensures nominal maps to 0 (important for masscom_obs_source='base').
-        """
-        if x is None:
-            raise ValueError("x must be a torch.Tensor")
-        if not torch.is_tensor(x):
-            x = torch.tensor(x, device=self._device, dtype=torch.float32)
-
-        scale = float(max(abs(float(x_min) - nominal), abs(float(x_max) - nominal), float(eps)))
-        y = (x - float(nominal)) / scale
-        return torch.clamp(y, -1.0, 1.0)
-
-    def _encode_minmax_priv_param(
-        self,
-        x: torch.Tensor,
-        *,
-        x_min: float,
-        x_max: float,
-        eps: float = EPS,
-    ) -> torch.Tensor:
-        """Map x from [x_min, x_max] to [-1, 1] using z' = 2z - 1.
-
-        z  = (x - x_min) / (x_max - x_min)
-        z' = 2z - 1
-        """
-        if x is None:
-            raise ValueError("x must be a torch.Tensor")
-        if not torch.is_tensor(x):
-            x = torch.tensor(x, device=self._device, dtype=torch.float32)
-
-        xmin = float(x_min)
-        xmax = float(x_max)
-        if xmax < xmin:
-            raise ValueError(f"x_max must be >= x_min, got {xmin}, {xmax}")
-
-        # Degenerate range: treat as "no variation" => neutral 0.
-        if (xmax - xmin) <= float(eps):
-            return torch.zeros_like(x)
-
-        z = (x - xmin) / (xmax - xmin)
-        y = 2.0 * z - 1.0
-        return torch.clamp(y, -1.0, 1.0)
-
     def _sample_k_iz(self, n: int) -> torch.Tensor:
         """Sample k_Iz for n envs. Returns shape (n, 1) torch tensor on self._device."""
         if n <= 0:
@@ -232,59 +176,6 @@ class USVVirtual(RLTask):
         new_inertias[:, 8] = target_izz
 
         # Write back through RigidPrimView batch API.
-        try:
-            self._heron.base.set_inertias(new_inertias, indices=env_ids)
-        except Exception as e:
-            if not getattr(self, "_yaw_inertia_set_warned", False):
-                self._yaw_inertia_set_warned = True
-                print(f"[USV] yaw inertia set_inertias failed once; skipping inertia writeback. err={e}")
-
-    def _write_yaw_inertia_scale(
-        self, env_ids: torch.Tensor, k_iz: torch.Tensor
-    ) -> None:
-        """Write back Izz = Iz0 * k_iz for selected envs (no sampling).
-
-        This is used by mass-driven coupling where k_iz is derived from mass.
-        """
-        if env_ids is None or len(env_ids) == 0:
-            return
-
-        # Ensure base inertias are cached.
-        self._maybe_init_base_inertias0()
-        if self._base_inertias0 is None:
-            if not getattr(self, "_yaw_inertia_init_warned", False):
-                self._yaw_inertia_init_warned = True
-                print(
-                    "[USV] yaw inertia writeback requested, but base inertias are not available yet; "
-                    "skipping Iz writeback until physics view is ready."
-                )
-            return
-
-        if k_iz is None:
-            raise ValueError("k_iz must be provided")
-        if not torch.is_tensor(k_iz):
-            k_iz = torch.tensor(k_iz, device=self._device, dtype=torch.float32)
-        if k_iz.ndim == 1:
-            k_iz = k_iz.view(-1, 1)
-
-        # Update buffer (used for privileged tail).
-        self.k_Iz[env_ids, :] = k_iz.to(device=self._device, dtype=torch.float32)
-
-        base_izz = self._base_inertias0[env_ids, 8]
-        target_izz = base_izz * k_iz.squeeze(-1)
-
-        try:
-            cur_inertias = self._heron.base.get_inertias(indices=env_ids, clone=True)
-        except Exception:
-            cur_inertias = None
-
-        if cur_inertias is None:
-            cur_inertias = self._base_inertias0[env_ids].clone()
-        elif not torch.is_tensor(cur_inertias):
-            cur_inertias = torch.tensor(cur_inertias, device=self._device, dtype=torch.float32)
-
-        new_inertias = cur_inertias.clone()
-        new_inertias[:, 8] = target_izz
         try:
             self._heron.base.set_inertias(new_inertias, indices=env_ids)
         except Exception as e:
@@ -376,45 +267,6 @@ class USVVirtual(RLTask):
             self._task_cfg["env"]["disturbances"]["mass"], self.num_envs, self._device
         )
 
-        # ---------------- Mass-driven coupling (episode-wise) ----------------
-        # Default disabled => preserve independent randomizations.
-        # NOTE: coupling only makes sense if mass disturbances are enabled; otherwise
-        # mass is constant and we treat coupling as effectively disabled (so privileged
-        # params stay neutral when randomization is off).
-        coupling_cfg = (
-            self._task_cfg.get("env", {})
-            .get("disturbances", {})
-            .get("coupling", {})
-            .get("mass_driven", {})
-            or {}
-        )
-        coupling_enabled_cfg = bool(coupling_cfg.get("enabled", False))
-        mass_dist_enabled = bool(getattr(self.MDD, "_add_mass_disturbances", False))
-        self._mass_driven_coupling_enabled = bool(coupling_enabled_cfg and mass_dist_enabled)
-        targets = coupling_cfg.get(
-            "targets", ["drag_scale", "thruster", "yaw_inertia"]
-        )
-        if targets is None:
-            targets = []
-        if isinstance(targets, str):
-            targets = [targets]
-        self._mass_driven_coupling_targets = [str(t) for t in targets]
-        self._mass_driven_couple_drag = (
-            self._mass_driven_coupling_enabled and "drag_scale" in self._mass_driven_coupling_targets
-        )
-        self._mass_driven_couple_thruster = (
-            self._mass_driven_coupling_enabled and "thruster" in self._mass_driven_coupling_targets
-        )
-        self._mass_driven_couple_yaw_inertia = (
-            self._mass_driven_coupling_enabled and "yaw_inertia" in self._mass_driven_coupling_targets
-        )
-
-        # Buffer for debugging/analysis: per-env normalized mass ratio r in [0, 1].
-        self.mass_ratio_r = torch.zeros(
-            (self._num_envs, 1), device=self._device, dtype=torch.float32
-        )
-        # ---------------- Mass-driven coupling (episode-wise) ----------------
-
         # Yaw inertia (Iz) randomization (episode-wise scalar) applied via RigidPrimView.set_inertias.
         _inertia_cfg = self._task_cfg["env"]["disturbances"].get("inertia", {})
         self._use_yaw_inertia_randomization = bool(
@@ -477,54 +329,6 @@ class USVVirtual(RLTask):
                 float(self.box_width),
                 float(max(self.heron_zero_height, 1.0)),
             ]
-
-        # Privileged tail dim (legacy name: mass_dim). Default is 4 (mass+CoM).
-        # Extended protocol is 8: [mass, com(x,y,z), k_drag, thr_L, thr_R, k_Iz].
-        _env_cfg = self._task_cfg.get("env", {})
-        self._priv_dim = int(_env_cfg.get("priv_dim", _env_cfg.get("mass_dim", 4)))
-        if self._priv_dim not in (4, 8):
-            raise ValueError(
-                f"Unsupported priv_dim/mass_dim={self._priv_dim}. Supported: 4 or 8."
-            )
-
-        # Privileged dynamics params encoding (applies to the extra 4 dims when priv_dim==8).
-        # - raw: use simulator scalars directly (historical behavior)
-        # - centered: encode as centered deltas around nominal (default nominal=1.0)
-        # - minmax: map [min,max] to [-1,1] via z' = 2z - 1
-        priv_params_cfg = _env_cfg.get("privileged_params", {}) or {}
-        self._privileged_params_mode = str(priv_params_cfg.get("mode", "raw"))
-        if self._privileged_params_mode not in ("raw", "centered", "minmax"):
-            raise ValueError(
-                "env.privileged_params.mode must be 'raw', 'centered' or 'minmax', "
-                f"got {self._privileged_params_mode}"
-            )
-        self._privileged_params_nominal = float(priv_params_cfg.get("nominal", 1.0))
-
-        # Range sources for centered encoding.
-        _drag_cfg = self._task_cfg["env"]["disturbances"].get("drag", {}) or {}
-        self._use_drag_scale_randomization_priv = bool(
-            _drag_cfg.get("use_drag_scale_randomization", False)
-        )
-        self._k_drag_min = float(_drag_cfg.get("k_drag_min", 1.0))
-        self._k_drag_max = float(_drag_cfg.get("k_drag_max", 1.0))
-
-        _thr_cfg = self._task_cfg["env"]["disturbances"].get("thruster", {}) or {}
-        # Per user request: always use thruster_rand as the normalization range source.
-        self._thruster_rand_for_priv = float(_thr_cfg.get("thruster_rand", 0.0))
-        if self._thruster_rand_for_priv < 0.0:
-            raise ValueError(f"thruster_rand must be >= 0, got {self._thruster_rand_for_priv}")
-
-        # Effective randomization activation flags for privileged encoding.
-        # Coupling can activate these even if the independent randomization flags are disabled.
-        self._use_drag_scale_randomization_priv = bool(
-            self._use_drag_scale_randomization_priv or self._mass_driven_couple_drag
-        )
-        self._use_yaw_inertia_randomization = bool(
-            self._use_yaw_inertia_randomization or self._mass_driven_couple_yaw_inertia
-        )
-        self._use_thruster_randomization_priv = bool(
-            _thr_cfg.get("use_thruster_randomization", False) or self._mass_driven_couple_thruster
-        )
         
         
         self.interpolationPointsFromRealDataLeft = self._task_cfg["dynamics"]["thrusters"]["interpolation"]["interpolationPointsFromRealDataLeft"]
@@ -542,13 +346,7 @@ class USVVirtual(RLTask):
         self.scaling_damping = self._task_cfg["dynamics"]["hydrodynamics"]["scaling_damping"]
         self.offset_added_mass = self._task_cfg["dynamics"]["hydrodynamics"]["offset_added_mass"]
         self.scaling_added_mass = self._task_cfg["dynamics"]["hydrodynamics"]["scaling_added_mass"]
-        self.task = task_factory.get(
-            task_cfg,
-            reward_cfg,
-            self._num_envs,
-            self._device,
-            priv_dim=self._priv_dim,
-        )
+        self.task = task_factory.get(task_cfg, reward_cfg, self._num_envs, self._device)
         self._penalties = parse_data_dict(Penalties(), penalty_cfg)
         self._num_observations = self.task._num_observations
         self._max_actions = 2#
@@ -849,195 +647,15 @@ class USVVirtual(RLTask):
                 com_obs_mode=self._com_obs_mode,
                 com_scale=self._com_obs_scale,
             )  # 获取质量和质心信息
-
-        # Assemble privileged tail.
-        # NOTE: even if priv_dim==4, we still build the 4-dim tail for uniformity.
-        if self._priv_dim == 4:
-            priv_tail = torch.cat([mass, com], dim=1)
-        else:
-            ones = torch.ones((self._num_envs, 1), device=self._device, dtype=torch.float32)
-            if self._masscom_obs_source == "base":
-                # For base-mode comparisons, we feed a fixed "neutral" value.
-                # - raw/centered: nominal=1.0 is neutral (centered => 0)
-                # - minmax: choose mid-range so that it maps to 0 under z'=2z-1
-                if self._privileged_params_mode == "minmax":
-                    k_drag = ones * (0.5 * (float(self._k_drag_min) + float(self._k_drag_max)))
-                    # Thruster neutral depends on its configured normalization range.
-                    # - legacy symmetric: [1-a, 1+a] => mid-range is 1.0
-                    # - coupling decay-only: [1-a, 1.0] => mid-range is 1-a/2
-                    a = float(self._thruster_rand_for_priv)
-                    if self._mass_driven_couple_thruster:
-                        thr_neutral = 1.0 - 0.5 * a
-                    else:
-                        thr_neutral = 1.0
-                    thr_l = ones * thr_neutral
-                    thr_r = ones * thr_neutral
-                    k_iz = ones * (0.5 * (float(self._k_iz_min) + float(self._k_iz_max)))
-                else:
-                    k_drag = ones
-                    thr_l = ones
-                    thr_r = ones
-                    k_iz = ones
-            else:
-                # Drag scale (episode-wise)
-                k_drag = ones
-                if hasattr(self, "hydrodynamics") and hasattr(self.hydrodynamics, "drag_scale"):
-                    k_drag = self.hydrodynamics.drag_scale
-
-                # Thruster multipliers (episode-wise)
-                td = getattr(self, "thrusters_dynamics", None)
-                thr_l = ones
-                thr_r = ones
-                if td is not None:
-                    if getattr(td, "_use_separate_randomization", False):
-                        thr_l = getattr(td, "thruster_left_multiplier", ones)
-                        thr_r = getattr(td, "thruster_right_multiplier", ones)
-                    else:
-                        thr = getattr(td, "thruster_multiplier", ones)
-                        thr_l = thr
-                        thr_r = thr
-
-                # Yaw inertia scale (episode-wise)
-                k_iz = ones
-                if hasattr(self, "k_Iz"):
-                    k_iz = self.k_Iz
-
-            if self._privileged_params_mode == "centered":
-                nominal = float(self._privileged_params_nominal)
-                k_drag = self._encode_centered_priv_param(
-                    k_drag,
-                    x_min=float(self._k_drag_min),
-                    x_max=float(self._k_drag_max),
-                    nominal=nominal,
-                )
-                thr_min = 1.0 - float(self._thruster_rand_for_priv)
-                # In mass-driven coupling mode, thruster only decays: [1-a, 1].
-                # Otherwise keep legacy symmetric range: [1-a, 1+a].
-                if self._mass_driven_couple_thruster:
-                    thr_max = 1.0
-                else:
-                    thr_max = 1.0 + float(self._thruster_rand_for_priv)
-                thr_l = self._encode_centered_priv_param(
-                    thr_l,
-                    x_min=thr_min,
-                    x_max=thr_max,
-                    nominal=nominal,
-                )
-                thr_r = self._encode_centered_priv_param(
-                    thr_r,
-                    x_min=thr_min,
-                    x_max=thr_max,
-                    nominal=nominal,
-                )
-                k_iz = self._encode_centered_priv_param(
-                    k_iz,
-                    x_min=float(self._k_iz_min),
-                    x_max=float(self._k_iz_max),
-                    nominal=nominal,
-                )
-            elif self._privileged_params_mode == "minmax":
-                # If a randomization is disabled, keep its privileged encoding neutral (0)
-                # to avoid injecting a constant -1/+1 bias through a static [min,max].
-                if self._use_drag_scale_randomization_priv:
-                    k_drag = self._encode_minmax_priv_param(
-                        k_drag,
-                        x_min=float(self._k_drag_min),
-                        x_max=float(self._k_drag_max),
-                    )
-                else:
-                    k_drag = torch.zeros_like(k_drag)
-
-                thr_min = 1.0 - float(self._thruster_rand_for_priv)
-                if self._mass_driven_couple_thruster:
-                    thr_max = 1.0
-                else:
-                    thr_max = 1.0 + float(self._thruster_rand_for_priv)
-
-                # Thruster: if disabled, keep neutral 0 to avoid constant bias.
-                if self._use_thruster_randomization_priv:
-                    thr_l = self._encode_minmax_priv_param(thr_l, x_min=thr_min, x_max=thr_max)
-                    thr_r = self._encode_minmax_priv_param(thr_r, x_min=thr_min, x_max=thr_max)
-                else:
-                    thr_l = torch.zeros_like(thr_l)
-                    thr_r = torch.zeros_like(thr_r)
-                if self._use_yaw_inertia_randomization:
-                    k_iz = self._encode_minmax_priv_param(
-                        k_iz,
-                        x_min=float(self._k_iz_min),
-                        x_max=float(self._k_iz_max),
-                    )
-                else:
-                    k_iz = torch.zeros_like(k_iz)
-
-            priv_tail = torch.cat([mass, com, k_drag, thr_l, thr_r, k_iz], dim=1)
-            if priv_tail.shape[1] != self._priv_dim:
-                raise RuntimeError(
-                    f"priv_tail dim mismatch: got {priv_tail.shape[1]}, expected {self._priv_dim}"
-                )
         self.obs_buf["state"] = self.task.get_state_observations(
             self.current_state,
             self._observation_frame,
             mass,
             com,
             prev_action=self.prev_thrust_cmds,
-            priv_tail=priv_tail,
         )
         observations = {self._heron.name: {"obs_buf": self.obs_buf}}
         return observations
-
-    def _apply_mass_driven_coupling(self, env_ids: torch.Tensor) -> None:
-        """Mass-driven coupling: mass -> r -> (k_drag, thr_scale, k_Iz) and write buffers."""
-        if not self._mass_driven_coupling_enabled:
-            return
-        if env_ids is None or len(env_ids) == 0:
-            return
-
-        # Compute r in [0, 1] using only upward mass variation: [base_mass, max_mass].
-        mass = self.MDD.platforms_mass[env_ids, 0:1].to(dtype=torch.float32)
-        base_mass = float(getattr(self.MDD, "_base_mass", 0.0))
-        max_mass = float(getattr(self.MDD, "_max_mass", base_mass))
-        denom = max(max_mass - base_mass, 1e-6)
-        r = (mass - base_mass) / denom
-        r = torch.clamp(r, 0.0, 1.0)
-        self.mass_ratio_r[env_ids, :] = r
-
-        ones = torch.ones_like(r)
-
-        # Drag scale coupling: k_drag(r) = kmin + r*(kmax-kmin)
-        if self._mass_driven_couple_drag and hasattr(self, "hydrodynamics"):
-            # Ensure hydrodynamics applies drag_scale in ComputeDampingMatrix.
-            if hasattr(self.hydrodynamics, "_use_drag_scale_randomization"):
-                self.hydrodynamics._use_drag_scale_randomization = True
-            kmin = float(self._k_drag_min)
-            kmax = float(self._k_drag_max)
-            k_drag = kmin + r * (kmax - kmin)
-            if hasattr(self.hydrodynamics, "drag_scale"):
-                self.hydrodynamics.drag_scale[env_ids, :] = k_drag
-
-        # Thruster coupling (left/right identical, decay only): s_thr(r) = 1 - r*a
-        if self._mass_driven_couple_thruster and hasattr(self, "thrusters_dynamics"):
-            td = self.thrusters_dynamics
-            a = float(self._thruster_rand_for_priv)
-            s_thr = ones - r * a
-            s_thr = torch.clamp(s_thr, 1.0 - a, 1.0)
-            # Ensure randomization path applies multipliers.
-            if hasattr(td, "_use_thruster_randomization"):
-                td._use_thruster_randomization = True
-            if hasattr(td, "_use_separate_randomization"):
-                td._use_separate_randomization = False
-            if hasattr(td, "thruster_multiplier"):
-                td.thruster_multiplier[env_ids, :] = s_thr
-            if hasattr(td, "thruster_left_multiplier"):
-                td.thruster_left_multiplier[env_ids, :] = s_thr
-            if hasattr(td, "thruster_right_multiplier"):
-                td.thruster_right_multiplier[env_ids, :] = s_thr
-
-        # Yaw inertia coupling: k_Iz(r) = kmin + r*(kmax-kmin), then write back Izz.
-        if self._mass_driven_couple_yaw_inertia:
-            kmin = float(self._k_iz_min)
-            kmax = float(self._k_iz_max)
-            k_iz = kmin + r * (kmax - kmin)
-            self._write_yaw_inertia_scale(env_ids, k_iz)
 
     def pre_physics_step(self, actions: torch.Tensor) -> None:
         if not self._env._world.is_playing():
@@ -1525,15 +1143,10 @@ class USVVirtual(RLTask):
         self.MDD.randomize_masses(env_ids, num_resets)
         self.MDD.set_masses(self._heron.base, env_ids)
 
-        # Apply independent randomizations (legacy) and then override with mass-driven coupling.
-        # Order matters:
-        # - Yaw inertia writeback must happen after mass/CoM updates.
-        # - Hydrodynamics/Thruster resets may still randomize other coefficients; coupling overrides scalars.
-        if not self._mass_driven_couple_yaw_inertia:
-            self._apply_yaw_inertia_randomization(env_ids, num_resets)
+        # Apply yaw inertia randomization after masses are updated.
+        self._apply_yaw_inertia_randomization(env_ids, num_resets)
         self.hydrodynamics.reset_coefficients(env_ids, num_resets)
         self.thrusters_dynamics.reset_thruster_randomization(env_ids, num_resets)
-        self._apply_mass_driven_coupling(env_ids)
         # Random scene generation (default) vs deterministic NPZ scene replay.
         if self.scene_replay_enabled:
             root_pos, root_rot, root_velocities = self._scene_replay_apply(env_ids)

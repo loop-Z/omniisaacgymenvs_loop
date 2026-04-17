@@ -64,7 +64,7 @@ import math
 import os
 import re
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import hydra
 import numpy as np
@@ -522,6 +522,150 @@ def _override_obs_priv_tail(obs_np: np.ndarray, *, tail_1d: np.ndarray, mass_dim
     return obs
 
 
+def _infer_ckpt_mlp_shapes(actor_arch_sd: Dict[str, torch.Tensor]) -> Dict[str, Any]:
+    """Infer loopz MLPEncode dims/shapes from a checkpoint state_dict.
+
+    We rely on the naming convention used by loopz checkpoints:
+    - ...mass_encoder.<idx>.weight
+    - ...action_mlp.<idx>.weight
+
+    Returns dict keys:
+    - ob_dim
+    - mass_dim
+    - mass_latent_dim
+    - mass_encoder_shape (hidden layer sizes)
+    - policy_net (action_mlp hidden layer sizes)
+    - action_in_dim
+    - act_dim
+    """
+
+    if not isinstance(actor_arch_sd, dict):
+        raise TypeError("actor_arch_sd must be a dict")
+
+    def _collect_linear(prefix: str) -> List[Tuple[int, int, int, str]]:
+        # Note: this is a *raw* regex string; use single backslashes.
+        # We want to match e.g. 'architecture.mass_encoder.0.weight'.
+        pat = re.compile(rf"(?:^|.*\.){re.escape(prefix)}\.(\d+)\.weight$")
+        out: List[Tuple[int, int, int, str]] = []
+        for k, v in actor_arch_sd.items():
+            if not torch.is_tensor(v):
+                continue
+            m = pat.match(str(k))
+            if not m:
+                continue
+            try:
+                idx = int(m.group(1))
+                out_dim = int(v.shape[0])
+                in_dim = int(v.shape[1])
+                out.append((idx, out_dim, in_dim, str(k)))
+            except Exception:
+                continue
+        out.sort(key=lambda t: t[0])
+        return out
+
+    mass_layers = _collect_linear("mass_encoder")
+    action_layers = _collect_linear("action_mlp")
+
+    if not mass_layers:
+        raise KeyError("Failed to infer mass_encoder layers from checkpoint (missing mass_encoder.*.weight)")
+    if not action_layers:
+        raise KeyError("Failed to infer action_mlp layers from checkpoint (missing action_mlp.*.weight)")
+
+    mass_dim = int(mass_layers[0][2])
+    mass_latent_dim = int(mass_layers[-1][1])
+    mass_encoder_shape = [int(x[1]) for x in mass_layers[:-1]]
+
+    action_in_dim = int(action_layers[0][2])
+    act_dim = int(action_layers[-1][1])
+    policy_net = [int(x[1]) for x in action_layers[:-1]]
+
+    nonpriv_dim = int(action_in_dim - mass_latent_dim)
+    if nonpriv_dim <= 0:
+        raise ValueError(
+            f"Inferred nonpriv_dim={nonpriv_dim} is invalid (action_in_dim={action_in_dim}, "
+            f"mass_latent_dim={mass_latent_dim})"
+        )
+    ob_dim = int(nonpriv_dim + mass_dim)
+
+    return {
+        "ob_dim": int(ob_dim),
+        "mass_dim": int(mass_dim),
+        "mass_latent_dim": int(mass_latent_dim),
+        "mass_encoder_shape": tuple(int(x) for x in mass_encoder_shape) if mass_encoder_shape else tuple(),
+        "policy_net": [int(x) for x in policy_net] if policy_net else [],
+        "action_in_dim": int(action_in_dim),
+        "act_dim": int(act_dim),
+    }
+
+
+def _adapt_obs_env_to_ckpt(
+    obs_np: np.ndarray,
+    *,
+    speed_dim: int,
+    mass_dim_env: int,
+    mass_dim_ckpt: int,
+    ob_dim_ckpt: int,
+    prev_action_dim: int = 2,
+) -> np.ndarray:
+    """Adapt env observation to the legacy ckpt input format.
+
+    Assumed env layout (current protocol):
+      [ speed(speed_dim), task(task_dim), prev_action(prev_action_dim), priv_tail(mass_dim_env) ]
+
+    Legacy layout (typical old ckpt):
+      [ speed(speed_dim), task(task_dim), priv_tail(mass_dim_ckpt) ]
+
+    The adapter:
+    - drops prev_action block
+    - truncates priv_tail from mass_dim_env -> mass_dim_ckpt by taking the first dims (mass/com first)
+    - or pads zeros if ckpt expects a longer tail than env provides
+    """
+
+    if obs_np is None:
+        return obs_np
+    obs = np.asarray(obs_np, dtype=np.float32)
+    if obs.ndim != 2:
+        return obs
+
+    sdim = int(speed_dim)
+    md_env = int(mass_dim_env)
+    md_ckpt = int(mass_dim_ckpt)
+    padim = int(prev_action_dim)
+
+    if obs.shape[1] == int(ob_dim_ckpt) and md_env == md_ckpt:
+        return obs
+
+    if obs.shape[1] < (sdim + md_env):
+        raise RuntimeError(
+            f"[loopz-play][compat] obs_dim_env={int(obs.shape[1])} too small for speed_dim={sdim} + mass_dim_env={md_env}"
+        )
+
+    task_dim_env = int(obs.shape[1]) - int(sdim) - int(padim) - int(md_env)
+    if task_dim_env < 0:
+        raise RuntimeError(
+            f"[loopz-play][compat] task_dim_env<0 (obs_dim_env={int(obs.shape[1])}, speed_dim={sdim}, "
+            f"prev_action_dim={padim}, mass_dim_env={md_env}). "
+            "This likely means the env observation layout is not [speed, task, prev_action, priv_tail]."
+        )
+
+    speed_task = obs[:, : int(sdim + task_dim_env)]
+    tail_env = obs[:, -int(md_env) :]
+    if md_ckpt <= md_env:
+        tail_ckpt = tail_env[:, : int(md_ckpt)]
+    else:
+        pad = np.zeros((int(obs.shape[0]), int(md_ckpt - md_env)), dtype=np.float32)
+        tail_ckpt = np.concatenate([tail_env, pad], axis=1)
+
+    out = np.concatenate([speed_task, tail_ckpt], axis=1)
+    if int(out.shape[1]) != int(ob_dim_ckpt):
+        raise RuntimeError(
+            f"[loopz-play][compat] adapted obs has wrong dim: got={int(out.shape[1])} expected={int(ob_dim_ckpt)} "
+            f"(obs_dim_env={int(obs.shape[1])}, speed_dim={sdim}, task_dim_env={task_dim_env}, "
+            f"prev_action_dim={padim}, mass_dim_env={md_env}, mass_dim_ckpt={md_ckpt})"
+        )
+    return out
+
+
 def _scene_replay_audit(task_obj: Any, *, env_id: int = 0) -> Dict[str, Any]:
     """Return minimal NPZ scene replay audit fields.
 
@@ -913,14 +1057,71 @@ def parse_hydra_configs(cfg: DictConfig):
     env.reset()
     _ = env.observe(False)
 
+    # ----- Optional: legacy checkpoint compatibility mode -----
+    # Default: disabled (strictly uses cfg/env dims).
+    # Enable via:
+    #   LOOPZ_PLAY_COMPAT_MODE=auto
+    # or (if present in YAML): task.env.eval.compat_mode=auto
+    compat_mode = str(os.getenv("LOOPZ_PLAY_COMPAT_MODE", "")).strip().lower()
+    if not compat_mode:
+        try:
+            _eval_cfg_tmp = cfg.task.env.get("eval", None)
+            compat_mode = str(getattr(_eval_cfg_tmp, "compat_mode", "none")).strip().lower() if _eval_cfg_tmp is not None else "none"
+        except Exception:
+            compat_mode = "none"
+    if compat_mode not in ("none", "auto"):
+        print(f"[loopz-play][WARN] unknown compat_mode='{compat_mode}', falling back to 'none'")
+        compat_mode = "none"
+
+    compat_fallback_on_load_fail = _env_flag("LOOPZ_PLAY_COMPAT_FALLBACK", "1")
+    print(
+        f"[loopz-play] compat_mode={compat_mode} compat_fallback_on_load_fail={int(bool(compat_fallback_on_load_fail))}"
+    )
+
+    prev_action_dim = 2
+    try:
+        prev_action_dim = int(os.getenv("LOOPZ_PLAY_PREV_ACTION_DIM", "2"))
+    except Exception:
+        prev_action_dim = 2
+
+    # Load loopz checkpoint early (needed for compat auto; also avoids double torch.load).
+    if not cfg.checkpoint:
+        raise ValueError("checkpoint must be provided for loopz-play")
+    ckpt = torch.load(cfg.checkpoint, map_location=torch.device(device_type))
+    if not isinstance(ckpt, dict) or "actor_architecture_state_dict" not in ckpt:
+        raise ValueError(
+            "checkpoint is not a loopz full_*.pt dict; expected key 'actor_architecture_state_dict'"
+        )
+    actor_arch_sd = ckpt["actor_architecture_state_dict"]
+
+    # We try to infer checkpoint shapes even when compat_mode=none, so we can provide
+    # actionable diagnostics and (optionally) fallback on load failure.
+    ckpt_shapes_any: Optional[Dict[str, Any]] = None
+    try:
+        ckpt_shapes_any = _infer_ckpt_mlp_shapes(actor_arch_sd)
+    except Exception:
+        ckpt_shapes_any = None
+    if compat_mode == "auto" and ckpt_shapes_any is not None:
+        try:
+            print(
+                "[loopz-play][compat] ckpt inferred: "
+                f"ob_dim={int(ckpt_shapes_any.get('ob_dim', -1))} "
+                f"mass_dim={int(ckpt_shapes_any.get('mass_dim', -1))} "
+                f"mass_latent_dim={int(ckpt_shapes_any.get('mass_latent_dim', -1))} "
+                f"action_in_dim={int(ckpt_shapes_any.get('action_in_dim', -1))} "
+                f"act_dim={int(ckpt_shapes_any.get('act_dim', -1))}"
+            )
+        except Exception:
+            pass
+
     # Build the loopz actor network.
     activation_fn_map = {"none": None, "tanh": nn.Tanh}
     output_activation_fn = activation_fn_map[cfg["architecture"]["activation"]]
     small_init_flag = cfg["architecture"]["small_init"]
 
     speed_dim = int(cfg["environment"].get("speed_dim", 3))
-    mass_dim = int(cfg["environment"].get("mass_dim", 4))
-    mass_latent_dim = int(cfg["architecture"].get("mass_latent_dim", 8))
+    mass_dim_env = int(cfg["environment"].get("mass_dim", 4))
+    mass_latent_dim_cfg = int(cfg["architecture"].get("mass_latent_dim", 8))
     _mass_encoder_shape_cfg = cfg["architecture"].get("mass_encoder_shape", [64, 16])
     if _mass_encoder_shape_cfg is None:
         mass_encoder_shape = (64, 16)
@@ -931,8 +1132,100 @@ def parse_hydra_configs(cfg: DictConfig):
             mass_encoder_shape = (64, 16)
 
     # Dimensions
-    ob_dim = int(env.num_obs)
+    ob_dim_env = int(env.num_obs)
     act_dim = int(env.num_acts)
+
+    # Infer ckpt-required dims/shapes (compat_mode=auto)
+    ckpt_shapes: Optional[Dict[str, Any]] = ckpt_shapes_any if compat_mode == "auto" else None
+    if compat_mode == "auto" and ckpt_shapes is None:
+        print("[loopz-play][WARN] compat_mode=auto but failed to infer ckpt shapes; falling back to env/cfg dims")
+
+    if ckpt_shapes is not None:
+        ob_dim_policy = int(ckpt_shapes["ob_dim"])
+        mass_dim_policy = int(ckpt_shapes["mass_dim"])
+        mass_latent_dim = int(ckpt_shapes["mass_latent_dim"])
+
+        # Important: empty lists/tuples are valid network definitions (no hidden layers).
+        # Do not use `or ...` fallback here.
+        _ckpt_policy_net = ckpt_shapes.get("policy_net", None)
+        if _ckpt_policy_net is None:
+            policy_net = list(cfg["architecture"]["policy_net"])
+        else:
+            policy_net = [int(x) for x in list(_ckpt_policy_net)]
+
+        _ckpt_mass_encoder_shape = ckpt_shapes.get("mass_encoder_shape", None)
+        if _ckpt_mass_encoder_shape is None:
+            # Keep the cfg-derived value.
+            pass
+        else:
+            mass_encoder_shape = tuple(int(x) for x in tuple(_ckpt_mass_encoder_shape))
+
+        # Guardrails: action dim should match.
+        try:
+            ckpt_act_dim = int(ckpt_shapes.get("act_dim", act_dim))
+            if ckpt_act_dim != int(act_dim):
+                print(
+                    f"[loopz-play][WARN] ckpt act_dim={ckpt_act_dim} != env act_dim={int(act_dim)}; "
+                    "load_state_dict may fail"
+                )
+        except Exception:
+            pass
+
+        adapt_needed = (int(ob_dim_env) != int(ob_dim_policy)) or (int(mass_dim_env) != int(mass_dim_policy))
+
+        # Auto-correct env mass_dim for observation slicing when users edited YAML just to match old ckpts.
+        # If only `prev_action` and/or priv-tail length changed, then task_dim is preserved.
+        try:
+            task_dim_ckpt = int(ob_dim_policy) - int(speed_dim) - int(mass_dim_policy)
+            md_env_inf = int(ob_dim_env) - int(speed_dim) - int(prev_action_dim) - int(task_dim_ckpt)
+            if md_env_inf > 0 and int(md_env_inf) != int(mass_dim_env):
+                if int(md_env_inf) in (4, 8):
+                    print(
+                        f"[loopz-play][compat] env mass_dim inferred from obs: cfg={int(mass_dim_env)} -> inferred={int(md_env_inf)} "
+                        "(using inferred for tail slicing/overrides)"
+                    )
+                    mass_dim_env = int(md_env_inf)
+                else:
+                    print(
+                        f"[loopz-play][WARN] env mass_dim inferred={int(md_env_inf)} (cfg={int(mass_dim_env)}) is unusual; "
+                        "keeping cfg value"
+                    )
+        except Exception:
+            pass
+
+        adapt_needed = (int(ob_dim_env) != int(ob_dim_policy)) or (int(mass_dim_env) != int(mass_dim_policy))
+        if adapt_needed:
+            print(
+                f"[loopz-play][compat] enabled (mode=auto): env_ob_dim={int(ob_dim_env)} -> ckpt_ob_dim={int(ob_dim_policy)}, "
+                f"env_mass_dim={int(mass_dim_env)} -> ckpt_mass_dim={int(mass_dim_policy)}, prev_action_dim={int(prev_action_dim)}"
+            )
+        else:
+            print(f"[loopz-play][compat] enabled (mode=auto): env dims already match ckpt (ob_dim={int(ob_dim_env)} mass_dim={int(mass_dim_env)})")
+
+        def _obs_for_policy(x: np.ndarray) -> np.ndarray:
+            if not adapt_needed:
+                return np.asarray(x, dtype=np.float32)
+            return _adapt_obs_env_to_ckpt(
+                x,
+                speed_dim=int(speed_dim),
+                mass_dim_env=int(mass_dim_env),
+                mass_dim_ckpt=int(mass_dim_policy),
+                ob_dim_ckpt=int(ob_dim_policy),
+                prev_action_dim=int(prev_action_dim),
+            )
+
+    else:
+        # Default: strictly follow current env/cfg.
+        ob_dim_policy = int(ob_dim_env)
+        mass_dim_policy = int(mass_dim_env)
+        mass_latent_dim = int(mass_latent_dim_cfg)
+        policy_net = list(cfg["architecture"]["policy_net"])
+
+        def _obs_for_policy(x: np.ndarray) -> np.ndarray:
+            return np.asarray(x, dtype=np.float32)
+
+    # Final policy input dimension
+    ob_dim = int(ob_dim_policy)
 
     # Action range (clipActions)
     try:
@@ -948,14 +1241,14 @@ def parse_hydra_configs(cfg: DictConfig):
     module_type = ppo_module.MLPEncode_wrap
     actor = ppo_module.Actor(
         module_type(
-            cfg["architecture"]["policy_net"],
+            policy_net,
             nn.LeakyReLU,
             ob_dim,
             act_dim,
             output_activation_fn,
             small_init_flag,
             speed_dim=speed_dim,
-            mass_dim=mass_dim,
+            mass_dim=mass_dim_policy,
             mass_latent_dim=mass_latent_dim,
             mass_encoder_shape=mass_encoder_shape,
         ),
@@ -963,17 +1256,80 @@ def parse_hydra_configs(cfg: DictConfig):
         device_type,
     )
 
-    # Load loopz checkpoint
-    if not cfg.checkpoint:
-        raise ValueError("checkpoint must be provided for loopz-play")
+    # Load loopz checkpoint (already loaded above as `ckpt`).
+    # If load fails due to protocol drift (e.g., prev_action added), optionally fallback
+    # to an auto-inferred legacy actor build.
+    try:
+        actor.architecture.load_state_dict(actor_arch_sd)
+    except RuntimeError as e:
+        if (compat_mode == "none") and bool(compat_fallback_on_load_fail) and (ckpt_shapes_any is not None):
+            print(
+                "[loopz-play][compat] load_state_dict failed in compat_mode=none; "
+                "retrying with auto-inferred legacy dims (set LOOPZ_PLAY_COMPAT_MODE=auto to make this explicit)"
+            )
 
-    ckpt = torch.load(cfg.checkpoint, map_location=torch.device(device_type))
-    if not isinstance(ckpt, dict) or "actor_architecture_state_dict" not in ckpt:
-        raise ValueError(
-            "checkpoint is not a loopz full_*.pt dict; expected key 'actor_architecture_state_dict'"
-        )
+            # Rebuild policy using ckpt inferred dims.
+            ob_dim_policy = int(ckpt_shapes_any["ob_dim"])
+            mass_dim_policy = int(ckpt_shapes_any["mass_dim"])
+            mass_latent_dim = int(ckpt_shapes_any["mass_latent_dim"])
+            _ckpt_policy_net = ckpt_shapes_any.get("policy_net", None)
+            if _ckpt_policy_net is None:
+                policy_net = list(cfg["architecture"]["policy_net"])
+            else:
+                policy_net = [int(x) for x in list(_ckpt_policy_net)]
 
-    actor.architecture.load_state_dict(ckpt["actor_architecture_state_dict"])
+            _ckpt_mass_encoder_shape = ckpt_shapes_any.get("mass_encoder_shape", None)
+            if _ckpt_mass_encoder_shape is not None:
+                mass_encoder_shape = tuple(int(x) for x in tuple(_ckpt_mass_encoder_shape))
+
+            # Re-infer env mass_dim for slicing/overrides as in compat auto.
+            try:
+                task_dim_ckpt = int(ob_dim_policy) - int(speed_dim) - int(mass_dim_policy)
+                md_env_inf = int(ob_dim_env) - int(speed_dim) - int(prev_action_dim) - int(task_dim_ckpt)
+                if md_env_inf > 0 and int(md_env_inf) in (4, 8):
+                    mass_dim_env = int(md_env_inf)
+            except Exception:
+                pass
+
+            adapt_needed = (int(ob_dim_env) != int(ob_dim_policy)) or (int(mass_dim_env) != int(mass_dim_policy))
+
+            def _obs_for_policy(x: np.ndarray) -> np.ndarray:
+                if not adapt_needed:
+                    return np.asarray(x, dtype=np.float32)
+                return _adapt_obs_env_to_ckpt(
+                    x,
+                    speed_dim=int(speed_dim),
+                    mass_dim_env=int(mass_dim_env),
+                    mass_dim_ckpt=int(mass_dim_policy),
+                    ob_dim_ckpt=int(ob_dim_policy),
+                    prev_action_dim=int(prev_action_dim),
+                )
+
+            print(
+                f"[loopz-play][compat] retry build: env_ob_dim={int(ob_dim_env)} -> ckpt_ob_dim={int(ob_dim_policy)}, "
+                f"env_mass_dim={int(mass_dim_env)} -> ckpt_mass_dim={int(mass_dim_policy)}, prev_action_dim={int(prev_action_dim)}"
+            )
+
+            actor = ppo_module.Actor(
+                module_type(
+                    policy_net,
+                    nn.LeakyReLU,
+                    int(ob_dim_policy),
+                    act_dim,
+                    output_activation_fn,
+                    small_init_flag,
+                    speed_dim=speed_dim,
+                    mass_dim=mass_dim_policy,
+                    mass_latent_dim=mass_latent_dim,
+                    mass_encoder_shape=mass_encoder_shape,
+                ),
+                ppo_module.SquashedGaussianDiagonalCovariance(act_dim, init_var, action_scale=action_scale),
+                device_type,
+            )
+
+            actor.architecture.load_state_dict(actor_arch_sd)
+        else:
+            raise
     if "actor_distribution_state_dict" in ckpt:
         actor.distribution.load_state_dict(ckpt["actor_distribution_state_dict"])
 
@@ -1065,12 +1421,12 @@ def parse_hydra_configs(cfg: DictConfig):
     if priv_tail_mode == "base_const_all":
         try:
             base_task0 = getattr(env, "_task", None)
-            base_const_all_tail = _compute_base_const_all_tail(base_task0, env_id=0, mass_dim=mass_dim)
+            base_const_all_tail = _compute_base_const_all_tail(base_task0, env_id=0, mass_dim=mass_dim_env)
             if base_const_all_tail is None:
                 print("[loopz-play][WARN] base_const_all enabled but failed to compute base tail; using normal tail")
             else:
                 tlist = [float(x) for x in np.asarray(base_const_all_tail).reshape(-1).tolist()]
-                print(f"[loopz-play] eval.priv_tail_mode=base_const_all (mass_dim={int(mass_dim)} tail={tlist})")
+                print(f"[loopz-play] eval.priv_tail_mode=base_const_all (mass_dim={int(mass_dim_env)} tail={tlist})")
         except Exception as e:
             print(f"[loopz-play][WARN] base_const_all init failed; using normal tail (err={type(e).__name__}: {e})")
             base_const_all_tail = None
@@ -1253,7 +1609,7 @@ def parse_hydra_configs(cfg: DictConfig):
                         episode_override_tail, episode_priv_tail_audit = _compute_wrong_random_tail(
                             base_task0,
                             env_id=0,
-                            mass_dim=mass_dim,
+                            mass_dim=mass_dim_env,
                             rng=wrong_tail_rng,
                         )
                         if episode_override_tail is None:
@@ -1262,7 +1618,7 @@ def parse_hydra_configs(cfg: DictConfig):
                             if print_wrong_tail or int(episode_idx) == 1:
                                 tlist = [float(x) for x in np.asarray(episode_override_tail).reshape(-1).tolist()]
                                 print(
-                                    f"[loopz-play] eval.priv_tail_mode=wrong_random (mass_dim={int(mass_dim)} tail={tlist} "
+                                    f"[loopz-play] eval.priv_tail_mode=wrong_random (mass_dim={int(mass_dim_env)} tail={tlist} "
                                     f"audit={episode_priv_tail_audit})"
                                 )
                     except Exception as e:
@@ -1271,7 +1627,7 @@ def parse_hydra_configs(cfg: DictConfig):
 
                 obs_np = env.observe(False)
                 if episode_override_tail is not None:
-                    obs_np = _override_obs_priv_tail(obs_np, tail_1d=episode_override_tail, mass_dim=mass_dim)
+                    obs_np = _override_obs_priv_tail(obs_np, tail_1d=episode_override_tail, mass_dim=mass_dim_env)
 
                 base_task = getattr(env, "_task", None)
                 scene_audit = _scene_replay_audit(base_task, env_id=0)
@@ -1366,8 +1722,11 @@ def parse_hydra_configs(cfg: DictConfig):
                 while not done:
                     with torch.no_grad():
                         if episode_override_tail is not None:
-                            obs_np = _override_obs_priv_tail(obs_np, tail_1d=episode_override_tail, mass_dim=mass_dim)
-                        obs_t = torch.from_numpy(obs_np).to(device_type).float()
+                            obs_np = _override_obs_priv_tail(
+                                obs_np, tail_1d=episode_override_tail, mass_dim=mass_dim_env
+                            )
+                        obs_np_policy = _obs_for_policy(obs_np)
+                        obs_t = torch.from_numpy(obs_np_policy).to(device_type).float()
                         mu = actor.architecture.architecture(obs_t)
                         action_t = torch.tanh(mu) * actor.distribution.action_scale
                         action_np = action_t.detach().cpu().numpy().astype(np.float32, copy=False)
@@ -1389,7 +1748,7 @@ def parse_hydra_configs(cfg: DictConfig):
                     reward_np, dones_np = env.step(action_np)
                     obs_np = env.observe(False)
                     if episode_override_tail is not None:
-                        obs_np = _override_obs_priv_tail(obs_np, tail_1d=episode_override_tail, mass_dim=mass_dim)
+                        obs_np = _override_obs_priv_tail(obs_np, tail_1d=episode_override_tail, mass_dim=mass_dim_env)
 
                     reward0 = float(np.asarray(reward_np).reshape(-1)[0])
                     done0 = bool(np.asarray(dones_np).reshape(-1)[0])

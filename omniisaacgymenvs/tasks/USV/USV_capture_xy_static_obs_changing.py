@@ -40,7 +40,7 @@ class CaptureXYTask(Core):
         reward_param: CaptureXYReward,
         num_envs: int,
         device: str,
-        priv_dim: int = 8,
+        priv_dim: int = 4,
     ) -> None:
         super(CaptureXYTask, self).__init__(num_envs, device, action_dim=2, priv_dim=priv_dim)
         # Task and reward parameters
@@ -427,9 +427,9 @@ class CaptureXYTask(Core):
         # IMPORTANT: only gate *positive* progress. Negative progress stays negative (still penalized),
         # otherwise the agent may learn to drift without penalty when misaligned.
         g = torch.clamp(torch.cos(self.heading_error), min=0.0, max=1.0)
-        dist_pos = torch.clamp(self.distance_reward, min=0.0)
-        dist_neg = torch.clamp(self.distance_reward, max=0.0)
-        self.distance_reward = dist_neg + g * dist_pos
+        # dist_pos = torch.clamp(self.distance_reward, min=0.0)
+        # dist_neg = torch.clamp(self.distance_reward, max=0.0)
+        # self.distance_reward = dist_neg + g * dist_pos
 
         # ---------------- B2: explicit heading-improvement reward ----------------
         # Encourage reducing heading error, especially when distance progress is gated.
@@ -462,7 +462,7 @@ class CaptureXYTask(Core):
         potential_raw = (self.prev_potential - current_potential) * potential_scale
 
         # A1 parameters (user-chosen)
-        r_dead = 0.01
+        r_dead = 0.008
         r_max = 2.0
 
         potential_raw = torch.where(potential_raw.abs() < r_dead, torch.zeros_like(potential_raw), potential_raw)
@@ -478,8 +478,11 @@ class CaptureXYTask(Core):
         delta_d = self.prev_position_dist - self.position_dist
         delta_d_pos = torch.clamp(delta_d, min=0.0)
 
-        v0, v1 = 0.02, 0.15
-        d1 = 0.01
+        # v0, v1 = 0.02, 0.15
+        # d1 = 0.01
+        v0, v1 = 0.01, 0.08
+        d1 = 0.03
+
         g_v = torch.clamp((v_toward_pos_for_gate - v0) / (v1 - v0 + 1e-6), 0.0, 1.0)
         g_d = torch.clamp(delta_d_pos / (d1 + 1e-6), 0.0, 1.0)
         
@@ -512,7 +515,7 @@ class CaptureXYTask(Core):
         
         # S2-a: only gate "large" positive shaping; let small positive shaping pass through.
         # Note: pot_pos is AFTER A1 (deadzone + tanh), so pot_pos in [0, r_max].
-        r_gate0 = 0.5
+        r_gate0 = 0.3
         gate_pos = torch.where(pot_pos < r_gate0, torch.ones_like(g_gate), g_gate)
         self.potential_shaping_reward = gate_pos * pot_pos + pot_neg
 
@@ -544,7 +547,7 @@ class CaptureXYTask(Core):
 
         # Heading gate scaling: p=2 (gentle, controllable)
         gate_scale = g * g
-        turn_hazard_penalty = (is_worsening & is_turning).float() * (-10.0) * gate_scale * speed_factor
+        turn_hazard_penalty = (is_worsening & is_turning).float() * (-5.0) * gate_scale * speed_factor
         
         
         
@@ -603,18 +606,33 @@ class CaptureXYTask(Core):
         self._turn_hazard_penalty = turn_hazard_penalty
 
         self.a = speed_reward  # 原记录（legacy 名：velocity_reward）
+        
+
+        # # Compute collision penalty
+        # self.collision_penalty = torch.zeros(self._num_envs, device=self._device, dtype=torch.float)
+        # for i in range(self.big):
+        #     obstacle_dist = torch.norm(self.xunlian_pos[:, i, :2] - current_state["position"], dim=1)
+        #     collision = obstacle_dist < self.collision_threshold
+        #     # print("奖励计算之间距离：：：：：：：",obstacle_dist)
+        #     # print("有没有发生碰撞：",collision)
+        #     self.collision_penalty += collision.float()* (-10.0) * 10.0
+        # self.collision_reward=self.collision_penalty
 
 
+        # Compute collision penalty (B1): single event penalty if ANY collision.
+        # Collision termination is handled in update_kills(); keep reward penalty moderate
+        # to avoid dominating early learning.
+        obstacle_rel = (
+            self.xunlian_pos[:, : self.big, :2]
+            - current_state["position"].unsqueeze(1)
+        )
+        obstacle_dist = torch.norm(obstacle_rel, dim=-1)
+        min_obstacle_dist = obstacle_dist.min(dim=1).values
+        collision_any = min_obstacle_dist < self.collision_threshold
 
-        # Compute collision penalty
-        self.collision_penalty = torch.zeros(self._num_envs, device=self._device, dtype=torch.float)
-        for i in range(self.big):
-            obstacle_dist = torch.norm(self.xunlian_pos[:, i, :2] - current_state["position"], dim=1)
-            collision = obstacle_dist < self.collision_threshold
-            # print("奖励计算之间距离：：：：：：：",obstacle_dist)
-            # print("有没有发生碰撞：",collision)
-            self.collision_penalty += collision.float()* (-10.0) * 10.0
-        self.collision_reward=self.collision_penalty
+        collision_penalty_scale = 20.0
+        self.collision_penalty = collision_any.to(dtype=torch.float32) * (-collision_penalty_scale)
+        self.collision_reward = self.collision_penalty
 
         # Add reward for reaching the goal
         goal_reward = (self._goal_reached * self._task_parameters.goal_reward).float() * 5.0

@@ -39,8 +39,9 @@ class GoToPoseTask(Core):
         reward_param: GoToPoseReward,
         num_envs: int,
         device: str,
+        priv_dim: int = 4,
     ) -> None:
-        super(GoToPoseTask, self).__init__(num_envs, device)
+        super(GoToPoseTask, self).__init__(num_envs, device, action_dim=2, priv_dim=priv_dim)
         # Task and reward parameters
         self._task_parameters = parse_data_dict(GoToPoseParameters(), task_param)
         self._reward_parameters = parse_data_dict(GoToPoseReward(), reward_param)
@@ -84,6 +85,7 @@ class GoToPoseTask(Core):
         mass: torch.Tensor = None,
         com: torch.Tensor = None,
         prev_action: torch.Tensor = None,
+        priv_tail: torch.Tensor = None,
     ) -> torch.Tensor:
         """
         Computes the observation tensor from the current state of the robot.""" ""
@@ -113,7 +115,14 @@ class GoToPoseTask(Core):
         self._task_data[:, 2] = torch.norm(self._position_error, dim=1)
         self._task_data[:, 3] = torch.cos(self._heading_error)
         self._task_data[:, 4] = torch.sin(self._heading_error)
-        return self.update_observation_tensor(current_state, observation_frame, mass, com, prev_action)
+        return self.update_observation_tensor(
+            current_state,
+            observation_frame,
+            mass,
+            com,
+            prev_action,
+            priv_tail=priv_tail,
+        )
     
 
 

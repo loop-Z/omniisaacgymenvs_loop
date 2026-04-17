@@ -9,6 +9,7 @@ Implements the recommended workflow:
 Supports two modes:
 1) Single-CSV sim-vs-base (legacy): compares obs_source == 'sim' vs 'base'.
 2) Run-vs-Run (two CSVs): compares CSV-A vs CSV-B by assigning a group label.
+3) Single-CSV absolute summary: compute absolute (non-diff) metrics for one CSV.
 
 Usage:
     # Legacy (sim vs base within one CSV)
@@ -18,12 +19,14 @@ Usage:
     python analyze_play_csv.py --csv-a runs/play_CSV/A.csv --csv-b runs/play_CSV/B.csv \
         --label-a randomized --label-b baseline --outdir runs/play_analysis/A_vs_B
 
-Outputs (in outdir):
-  - qc_summary.json
-  - layer0_summary.csv
-  - layer0plus_regression.txt
-  - stratified_effects.csv
-  - plots_stratified.png
+Outputs (in outdir) (defaults; extra outputs are opt-in via CLI flags):
+    - qc_summary.json
+    - layer0_summary.csv
+    - layer0_paired_summary.csv
+
+Additional outputs:
+    - absolute_summary.csv (when using --csv-single)
+    - absolute_summary_treat.csv / absolute_summary_control.csv (when comparing groups)
 
 Notes:
 - This script does NOT modify any simulation code; it is offline analysis only.
@@ -42,6 +45,95 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
+
+
+def absolute_summary_from_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute absolute (non-diff) metrics for a single run/group.
+
+    Metric set is intentionally aligned with `layer0_bootstrap_groups` (non-paired Layer-0):
+    - Binary rates: success/collision/out_of_bounds
+    - Continuous: return_scaled/raw, path_efficiency/length (mean+median)
+    - Success-only: time_to_goal_sec, steps_to_goal, min_obs_dist_min
+    - Safety all-episode: time_fraction_obs_dist_lt_d0
+    - Smoothness success-only: action_tv_total/per_sec, yaw_rate_tv_per_sec, jerk_rms (mean+median)
+
+    Output schema:
+        metric, value, n, n_total
+    """
+
+    if df is None:
+        raise ValueError("df is None")
+    _require_column(df, "success")
+    d = df.copy()
+
+    out_rows: List[Dict[str, object]] = []
+
+    def _add(metric: str, values: pd.Series, stat: str) -> None:
+        x = _as_float(values).to_numpy(dtype=np.float64)
+        x = x[np.isfinite(x)]
+        if x.size == 0:
+            v = float("nan")
+        else:
+            if stat == "mean":
+                v = float(np.mean(x))
+            elif stat == "median":
+                v = float(np.median(x))
+            else:
+                raise ValueError(f"unknown stat: {stat}")
+        out_rows.append(
+            {
+                "metric": str(metric),
+                "value": float(v),
+                "n": int(x.size),
+                "n_total": int(len(d)),
+            }
+        )
+
+    # Binary rates (mean of 0/1)
+    _add("success_rate", d["success"], "mean")
+    for bin_col in ["collision", "out_of_bounds"]:
+        if bin_col in d.columns:
+            _add(f"{bin_col}_rate", d[bin_col], "mean")
+
+    # Continuous outcomes
+    for col in ["return_scaled", "return_raw", "path_efficiency", "path_length"]:
+        if col not in d.columns:
+            continue
+        _add(f"{col}_mean", d[col], "mean")
+        _add(f"{col}_median", d[col], "median")
+
+    # Success-only subset
+    succ = d[_as_float(d["success"]) == 1.0]
+
+    # Time to goal for successes only (avoid NaNs) (supports new name)
+    time_col = "steps_to_goal_sec" if "steps_to_goal_sec" in d.columns else "time_to_goal_sec"
+    if time_col in d.columns:
+        _add("time_to_goal_sec_success_mean", succ.get(time_col, pd.Series([], dtype=float)), "mean")
+
+    # Steps to goal for successes only
+    if "steps_to_goal" in d.columns:
+        _add("steps_to_goal_mean_success", succ.get("steps_to_goal", pd.Series([], dtype=float)), "mean")
+
+    # Safety metrics
+    if "min_obs_dist_min" in d.columns:
+        _add("min_obs_dist_min_success_mean", succ.get("min_obs_dist_min", pd.Series([], dtype=float)), "mean")
+    if "time_fraction_obs_dist_lt_d0" in d.columns:
+        _add("time_fraction_obs_dist_lt_d0_mean", d["time_fraction_obs_dist_lt_d0"], "mean")
+
+    # Smoothness metrics (success-only summaries to avoid short-failure bias)
+    smooth_cols = [
+        "action_tv_total",
+        "action_tv_per_sec",
+        "yaw_rate_tv_per_sec",
+        "jerk_rms",
+    ]
+    for col in smooth_cols:
+        if col not in d.columns:
+            continue
+        _add(f"{col}_success_mean", succ.get(col, pd.Series([], dtype=float)), "mean")
+        _add(f"{col}_success_median", succ.get(col, pd.Series([], dtype=float)), "median")
+
+    return pd.DataFrame(out_rows)
 
 
 def _require_column(df: pd.DataFrame, col: str) -> None:
@@ -76,14 +168,55 @@ def _safe_str(x: object) -> str:
 def _load_csv(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path)
     # Normalize dtypes for a few known columns
-    for c in ["success", "collision", "out_of_bounds"]:
+    for c in [
+        "success",
+        "collision",
+        "out_of_bounds",
+        # Newer metrics
+        "steps_to_goal",
+        "steps_to_goal_sec",
+        "min_obs_dist_min",
+        "time_fraction_obs_dist_lt_d0",
+        "d0_margin_m",
+        "d0_m",
+
+        # Smoothness metrics
+        "action_tv_total",
+        "action_tv_per_sec",
+        "yaw_rate_tv_per_sec",
+        "jerk_rms",
+    ]:
         if c in df.columns:
             df[c] = _as_float(df[c])
     # Normalize string columns that we frequently group on.
-    for c in ["obs_source", "done_reason", "obstacles_hash"]:
+    for c in ["obs_source", "done_reason", "obstacles_hash", "group"]:
         if c in df.columns:
             df[c] = df[c].astype(str).map(_safe_str)
     return df
+
+
+def _bootstrap_mean_ci_from_deltas(deltas: np.ndarray, *, n_boot: int, seed: int) -> Dict[str, float]:
+    """Bootstrap CI for mean(delta) given paired deltas.
+
+    deltas should be 1D; NaNs are ignored.
+    """
+
+    rng = np.random.default_rng(seed)
+    v = np.asarray(deltas, dtype=np.float64).reshape(-1)
+    v = v[np.isfinite(v)]
+    n = int(v.size)
+    if n == 0:
+        return {"n": 0.0, "diff": float("nan"), "ci_lo": float("nan"), "ci_hi": float("nan")}
+    point = float(np.mean(v))
+    if n == 1:
+        return {"n": float(n), "diff": point, "ci_lo": point, "ci_hi": point}
+
+    means = np.empty(int(n_boot), dtype=np.float64)
+    for i in range(int(n_boot)):
+        idx = rng.integers(0, n, size=n)
+        means[i] = float(np.mean(v[idx]))
+    lo, hi = np.quantile(means, [0.025, 0.975])
+    return {"n": float(n), "diff": point, "ci_lo": float(lo), "ci_hi": float(hi)}
 
 
 def _bootstrap_diff(
@@ -145,10 +278,29 @@ class QCSummary:
     control: str
     n_treat: int
     n_control: int
+    # Legacy: obstacles_hash pairing stats (may be 0 if column missing)
     obstacles_hash_treat_unique: int
     obstacles_hash_control_unique: int
     obstacles_hash_intersection: int
     obstacles_hash_pair_upper_bound: int
+
+    # Preferred (NPZ scene replay): scene_idx pairing stats
+    scene_idx_treat_unique: int
+    scene_idx_control_unique: int
+    scene_idx_intersection: int
+    scene_idx_pair_upper_bound: int
+
+    # Minimal replay audit signal
+    obstacles_hash_match_rate_treat: float
+    obstacles_hash_match_rate_control: float
+
+    # Steps-to-goal missingness alignment (expected: missing ~= failures)
+    steps_to_goal_missing_treat: int
+    steps_to_goal_missing_control: int
+    steps_to_goal_failures_treat: int
+    steps_to_goal_failures_control: int
+    steps_to_goal_missing_minus_failures_treat: int
+    steps_to_goal_missing_minus_failures_control: int
     missingness: Dict[str, Dict[str, int]]
     done_reasons: Dict[str, Dict[str, int]]
 
@@ -184,17 +336,83 @@ def qc_diagnostics_groups(df: pd.DataFrame, *, group_col: str, treat: str, contr
     else:
         treat_unique = control_unique = inter_size = pair_ub = 0
 
+    # Scene idx diagnostics (preferred pairing key under NPZ replay)
+    if "scene_idx" in df.columns:
+        treat_scene = _as_int(treat_df["scene_idx"]).astype("Int64")
+        control_scene = _as_int(control_df["scene_idx"]).astype("Int64")
+
+        treat_list = [int(x) for x in treat_scene.dropna().astype(int).unique().tolist()]
+        control_list = [int(x) for x in control_scene.dropna().astype(int).unique().tolist()]
+        treat_set_scene = set(treat_list)
+        control_set_scene = set(control_list)
+        inter_scene = treat_set_scene & control_set_scene
+
+        treat_counts_scene = treat_scene.dropna().astype(int).value_counts()
+        control_counts_scene = control_scene.dropna().astype(int).value_counts()
+        pair_ub_scene = 0
+        for s in inter_scene:
+            pair_ub_scene += int(min(treat_counts_scene.get(s, 0), control_counts_scene.get(s, 0)))
+
+        treat_unique_scene = int(len(treat_set_scene))
+        control_unique_scene = int(len(control_set_scene))
+        inter_size_scene = int(len(inter_scene))
+    else:
+        treat_unique_scene = control_unique_scene = inter_size_scene = pair_ub_scene = 0
+
+    # Obstacles hash match rate (when replay audit is enabled)
+    def _match_rate(sub: pd.DataFrame) -> float:
+        if "obstacles_hash_match" not in sub.columns:
+            return float("nan")
+        x = _as_float(sub["obstacles_hash_match"]).to_numpy(dtype=np.float64)
+        x = x[np.isfinite(x)]
+        if x.size == 0:
+            return float("nan")
+        # Accept both {0,1} numeric and {True,False} stringish; numeric coercion above handles most.
+        return float(np.mean(x > 0.5))
+
+    match_rate_treat = _match_rate(treat_df)
+    match_rate_control = _match_rate(control_df)
+
+    # steps_to_goal missingness should align with failures (success==0)
+    def _fail_count(sub: pd.DataFrame) -> int:
+        if "success" not in sub.columns:
+            return 0
+        s = _as_float(sub["success"]).to_numpy(dtype=np.float64)
+        s = s[np.isfinite(s)]
+        if s.size == 0:
+            return 0
+        return int(np.sum(s < 0.5))
+
+    if "steps_to_goal" in df.columns:
+        steps_missing_t = int(treat_df["steps_to_goal"].isna().sum())
+        steps_missing_c = int(control_df["steps_to_goal"].isna().sum())
+    else:
+        steps_missing_t = 0
+        steps_missing_c = 0
+    fail_t = _fail_count(treat_df)
+    fail_c = _fail_count(control_df)
+
     # Missingness for a few key metrics
     check_cols = [
         "success",
         "return_scaled",
         "return_raw",
+        # Legacy + new naming
         "time_to_goal_sec",
+        "steps_to_goal",
+        "steps_to_goal_sec",
         "episode_len_steps",
         "path_length",
         "path_efficiency",
         "collision",
         "out_of_bounds",
+        "min_obs_dist_min",
+        "time_fraction_obs_dist_lt_d0",
+        # Smoothness (often success-only => NaN on failures)
+        "action_tv_total",
+        "action_tv_per_sec",
+        "yaw_rate_tv_per_sec",
+        "jerk_rms",
     ]
     missingness: Dict[str, Dict[str, int]] = {str(treat): {}, str(control): {}}
     for col in check_cols:
@@ -221,6 +439,18 @@ def qc_diagnostics_groups(df: pd.DataFrame, *, group_col: str, treat: str, contr
         obstacles_hash_control_unique=int(control_unique),
         obstacles_hash_intersection=int(inter_size),
         obstacles_hash_pair_upper_bound=int(pair_ub),
+        scene_idx_treat_unique=int(treat_unique_scene),
+        scene_idx_control_unique=int(control_unique_scene),
+        scene_idx_intersection=int(inter_size_scene),
+        scene_idx_pair_upper_bound=int(pair_ub_scene),
+        obstacles_hash_match_rate_treat=float(match_rate_treat),
+        obstacles_hash_match_rate_control=float(match_rate_control),
+        steps_to_goal_missing_treat=int(steps_missing_t),
+        steps_to_goal_missing_control=int(steps_missing_c),
+        steps_to_goal_failures_treat=int(fail_t),
+        steps_to_goal_failures_control=int(fail_c),
+        steps_to_goal_missing_minus_failures_treat=int(steps_missing_t - fail_t),
+        steps_to_goal_missing_minus_failures_control=int(steps_missing_c - fail_c),
         missingness=missingness,
         done_reasons=done_reasons,
     )
@@ -295,15 +525,177 @@ def layer0_bootstrap_groups(
         )
 
     # Time to goal for successes only (avoid NaNs)
-    if "time_to_goal_sec" in df.columns:
+    time_col = "steps_to_goal_sec" if "steps_to_goal_sec" in df.columns else "time_to_goal_sec"
+    if time_col in df.columns:
         treat_succ = treat_df[_as_float(treat_df["success"]) == 1.0]
         control_succ = control_df[_as_float(control_df["success"]) == 1.0]
         add_metric(
             "time_to_goal_sec_success_mean",
-            _as_float(treat_succ["time_to_goal_sec"]).to_numpy(dtype=np.float64),
-            _as_float(control_succ["time_to_goal_sec"]).to_numpy(dtype=np.float64),
+            _as_float(treat_succ[time_col]).to_numpy(dtype=np.float64),
+            _as_float(control_succ[time_col]).to_numpy(dtype=np.float64),
             _mean_stat,
         )
+
+    # Steps to goal for successes only
+    if "steps_to_goal" in df.columns:
+        treat_succ = treat_df[_as_float(treat_df["success"]) == 1.0]
+        control_succ = control_df[_as_float(control_df["success"]) == 1.0]
+        add_metric(
+            "steps_to_goal_mean_success",
+            _as_float(treat_succ["steps_to_goal"]).to_numpy(dtype=np.float64),
+            _as_float(control_succ["steps_to_goal"]).to_numpy(dtype=np.float64),
+            _mean_stat,
+        )
+
+    # Safety metrics
+    if "min_obs_dist_min" in df.columns:
+        treat_succ = treat_df[_as_float(treat_df["success"]) == 1.0]
+        control_succ = control_df[_as_float(control_df["success"]) == 1.0]
+        add_metric(
+            "min_obs_dist_min_success_mean",
+            _as_float(treat_succ["min_obs_dist_min"]).to_numpy(dtype=np.float64),
+            _as_float(control_succ["min_obs_dist_min"]).to_numpy(dtype=np.float64),
+            _mean_stat,
+        )
+
+    if "time_fraction_obs_dist_lt_d0" in df.columns:
+        add_metric(
+            "time_fraction_obs_dist_lt_d0_mean",
+            _as_float(treat_df["time_fraction_obs_dist_lt_d0"]).to_numpy(dtype=np.float64),
+            _as_float(control_df["time_fraction_obs_dist_lt_d0"]).to_numpy(dtype=np.float64),
+            _mean_stat,
+        )
+
+    # Smoothness metrics (success-only summaries to avoid short-failure bias)
+    smooth_cols = [
+        "action_tv_total",
+        "action_tv_per_sec",
+        "yaw_rate_tv_per_sec",
+        "jerk_rms",
+    ]
+    for col in smooth_cols:
+        if col not in df.columns:
+            continue
+        treat_succ = treat_df[_as_float(treat_df["success"]) == 1.0]
+        control_succ = control_df[_as_float(control_df["success"]) == 1.0]
+        add_metric(
+            f"{col}_success_mean",
+            _as_float(treat_succ[col]).to_numpy(dtype=np.float64),
+            _as_float(control_succ[col]).to_numpy(dtype=np.float64),
+            _mean_stat,
+        )
+        add_metric(
+            f"{col}_success_median",
+            _as_float(treat_succ[col]).to_numpy(dtype=np.float64),
+            _as_float(control_succ[col]).to_numpy(dtype=np.float64),
+            _median_stat,
+        )
+
+    return pd.DataFrame(out_rows)
+
+
+def layer0_paired_bootstrap_groups(
+    df: pd.DataFrame,
+    *,
+    group_col: str,
+    treat: str,
+    control: str,
+    pair_col: str,
+    n_boot: int,
+    seed: int,
+) -> pd.DataFrame:
+    """Paired diffs with bootstrap CIs by resampling pairs.
+
+    Pairing is done by `pair_col` (recommended: scene_idx under NPZ replay).
+    For each pair key k, we compute mean(metric | treat,k) - mean(metric | control,k).
+    Then we bootstrap over keys.
+    """
+
+    _require_column(df, group_col)
+    _require_column(df, "success")
+    _require_column(df, pair_col)
+
+    d = df.copy()
+    d[group_col] = d[group_col].astype(str).map(_safe_str)
+
+    # Keep only rows where pair_col is present.
+    key = _as_int(d[pair_col])
+    d = d.loc[key.notna()].copy()
+    d[pair_col] = key.loc[key.notna()].astype(int)
+
+    # Keys present in both groups.
+    keys_t = set(d.loc[d[group_col] == str(treat), pair_col].astype(int).unique().tolist())
+    keys_c = set(d.loc[d[group_col] == str(control), pair_col].astype(int).unique().tolist())
+    keys = sorted(list(keys_t & keys_c))
+
+    out_rows: List[Dict[str, object]] = []
+
+    def _paired_deltas(col: str, *, succ_only: bool = False) -> np.ndarray:
+        deltas: List[float] = []
+        for k in keys:
+            sub = d[d[pair_col] == int(k)]
+            if succ_only:
+                sub = sub[_as_float(sub["success"]) == 1.0]
+            t_sub = sub[sub[group_col] == str(treat)]
+            c_sub = sub[sub[group_col] == str(control)]
+            if len(t_sub) == 0 or len(c_sub) == 0:
+                continue
+            vt = _as_float(t_sub[col]).to_numpy(dtype=np.float64)
+            vc = _as_float(c_sub[col]).to_numpy(dtype=np.float64)
+            mt = float(np.nanmean(vt))
+            mc = float(np.nanmean(vc))
+            if not (np.isfinite(mt) and np.isfinite(mc)):
+                continue
+            deltas.append(mt - mc)
+        return np.asarray(deltas, dtype=np.float64)
+
+    def add_metric(name: str, deltas: np.ndarray):
+        res = _bootstrap_mean_ci_from_deltas(deltas, n_boot=n_boot, seed=seed)
+        out_rows.append(
+            {
+                "metric": name,
+                "n_pairs": int(res["n"]),
+                "diff_treat_minus_control": float(res["diff"]),
+                "ci95_lo": float(res["ci_lo"]),
+                "ci95_hi": float(res["ci_hi"]),
+            }
+        )
+
+    # Binary rates
+    add_metric("success_rate", _paired_deltas("success", succ_only=False))
+    for bin_col in ["collision", "out_of_bounds"]:
+        if bin_col in d.columns:
+            add_metric(f"{bin_col}_rate", _paired_deltas(bin_col, succ_only=False))
+
+    # Continuous outcomes
+    for col in ["return_scaled", "return_raw", "path_efficiency", "path_length"]:
+        if col not in d.columns:
+            continue
+        add_metric(f"{col}_mean", _paired_deltas(col, succ_only=False))
+
+    # Time to goal for successes only (supports new name)
+    time_col = "steps_to_goal_sec" if "steps_to_goal_sec" in d.columns else "time_to_goal_sec"
+    if time_col in d.columns:
+        add_metric("time_to_goal_sec_success_mean", _paired_deltas(time_col, succ_only=True))
+
+    # Steps to goal for successes only
+    if "steps_to_goal" in d.columns:
+        add_metric("steps_to_goal_mean_success", _paired_deltas("steps_to_goal", succ_only=True))
+
+    # Safety metrics
+    if "min_obs_dist_min" in d.columns:
+        add_metric("min_obs_dist_min_success_mean", _paired_deltas("min_obs_dist_min", succ_only=True))
+    if "time_fraction_obs_dist_lt_d0" in d.columns:
+        add_metric(
+            "time_fraction_obs_dist_lt_d0_mean",
+            _paired_deltas("time_fraction_obs_dist_lt_d0", succ_only=False),
+        )
+
+    # Smoothness metrics (success-only)
+    for col in ["action_tv_total", "action_tv_per_sec", "yaw_rate_tv_per_sec", "jerk_rms"]:
+        if col not in d.columns:
+            continue
+        add_metric(f"{col}_success_mean", _paired_deltas(col, succ_only=True))
 
     return pd.DataFrame(out_rows)
 
@@ -983,6 +1375,12 @@ def plot_stratified_effects(strat_df: pd.DataFrame, out_path: Path) -> None:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--csv", type=str, default="", help="Input play CSV path (legacy: sim vs base)")
+    p.add_argument(
+        "--csv-single",
+        type=str,
+        default="",
+        help="Single CSV path: compute absolute (non-diff) metrics only",
+    )
     p.add_argument("--csv-a", type=str, default="", help="CSV-A path (run-vs-run)")
     p.add_argument("--csv-b", type=str, default="", help="CSV-B path (run-vs-run)")
     p.add_argument("--label-a", type=str, default="A", help="Group label for CSV-A")
@@ -995,6 +1393,35 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     p.add_argument("--seed", type=int, default=0, help="RNG seed for bootstrap")
     p.add_argument("--n-boot", type=int, default=5000, help="Bootstrap samples for Layer-0")
+
+    # Default outputs are minimal and aligned with NPZ scene replay pairing.
+    # Extra analyses are opt-in.
+    p.add_argument(
+        "--no-paired",
+        action="store_true",
+        help="Disable paired Layer-0 (scene_idx-based) summary.",
+    )
+    p.add_argument(
+        "--do-layer0plus",
+        action="store_true",
+        help="Enable Layer-0+ regression adjustment (requires extra covariate columns).",
+    )
+    p.add_argument(
+        "--do-strat",
+        action="store_true",
+        help="Enable stratified effect curves (quantile bins).",
+    )
+    p.add_argument(
+        "--do-rand-qc",
+        action="store_true",
+        help="Enable randomization parameter QC table output.",
+    )
+    p.add_argument(
+        "--do-attrib",
+        action="store_true",
+        help="Enable within-group attribution + optional binned sensitivity tables.",
+    )
+
     p.add_argument("--n-boot-strat", type=int, default=1000, help="Bootstrap samples per stratum")
     p.add_argument("--bins", type=int, default=5, help="Quantile bins for stratified curves")
     p.add_argument(
@@ -1061,12 +1488,45 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     csv_a = _safe_str(args.csv_a)
     csv_b = _safe_str(args.csv_b)
     csv_single = _safe_str(args.csv)
+    csv_single_abs = _safe_str(args.csv_single)
+
+    # Mutually exclusive modes.
+    if csv_single_abs and (csv_single or csv_a or csv_b):
+        raise ValueError("Provide --csv-single OR --csv / (--csv-a and --csv-b), not both")
 
     use_run_vs_run = bool(csv_a and csv_b)
     if use_run_vs_run and csv_single:
         raise ValueError("Provide either --csv (legacy) OR (--csv-a and --csv-b), not both")
-    if (not use_run_vs_run) and (not csv_single):
-        raise ValueError("Missing input: provide --csv OR (--csv-a and --csv-b)")
+    if (not csv_single_abs) and (not use_run_vs_run) and (not csv_single):
+        raise ValueError("Missing input: provide --csv-single OR --csv OR (--csv-a and --csv-b)")
+
+    # Absolute-only single CSV mode.
+    if csv_single_abs:
+        csv_path = Path(csv_single_abs)
+        if not csv_path.exists():
+            raise FileNotFoundError(str(csv_path))
+        df_single = _load_csv(csv_path)
+        stem = csv_path.stem
+
+        outdir = Path(args.outdir) if args.outdir else Path("runs/play_analysis") / stem
+        _ensure_outdir(outdir)
+
+        abs_sum = absolute_summary_from_df(df_single)
+        abs_sum.to_csv(outdir / "absolute_summary.csv", index=False)
+
+        # Also emit QC summary (no treat/control notion; store minimal self-QC).
+        # We keep the JSON shape compatible by using a trivial one-group setup.
+        df_single = df_single.copy()
+        df_single["__group"] = "all"
+        qc = qc_diagnostics_groups(df_single, group_col="__group", treat="all", control="all")
+        qc_payload = dict(qc.__dict__)
+        (outdir / "qc_summary.json").write_text(
+            json.dumps(qc_payload, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        # Skip diff summaries by design.
+        return 0
 
     if use_run_vs_run:
         path_a = Path(csv_a)
@@ -1101,37 +1561,61 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     outdir = Path(args.outdir) if args.outdir else Path("runs/play_analysis") / stem
     _ensure_outdir(outdir)
 
+    # Absolute summaries (non-paired / non-diff) for treat/control groups.
+    # These are aligned with layer0_summary metric names, but store per-group values.
+    try:
+        treat_df_abs = df[df[group_col].astype(str) == str(treat)].copy()
+        control_df_abs = df[df[group_col].astype(str) == str(control)].copy()
+        abs_t = absolute_summary_from_df(treat_df_abs)
+        abs_c = absolute_summary_from_df(control_df_abs)
+        abs_t.to_csv(outdir / "absolute_summary_treat.csv", index=False)
+        abs_c.to_csv(outdir / "absolute_summary_control.csv", index=False)
+    except Exception as e:
+        # Keep main workflow robust even if absolute summaries fail.
+        (outdir / "absolute_summary_treat.csv").write_text(
+            f"absolute summary failed: {type(e).__name__}: {e}\n",
+            encoding="utf-8",
+        )
+        (outdir / "absolute_summary_control.csv").write_text(
+            f"absolute summary failed: {type(e).__name__}: {e}\n",
+            encoding="utf-8",
+        )
+
     # QC
     qc = qc_diagnostics_groups(df, group_col=group_col, treat=treat, control=control)
     qc_payload = dict(qc.__dict__)
 
-    # Suggest bins based on sample size (helps avoid noisy stratified curves)
-    bins_hint = _suggest_bins_for_min_per_bin(
-        n_treat=qc.n_treat,
-        n_control=qc.n_control,
-        bins_requested=int(args.bins),
-        min_per_bin=int(args.min_per_bin),
-    )
-    qc_payload["stratified_bins_hint"] = bins_hint
-
+    bins_hint: Dict[str, int] = {}
     bins_used = int(args.bins)
-    if bool(args.auto_bins):
-        bins_used = int(bins_hint["bins_suggested"])
+    if bool(args.do_strat) or bool(args.auto_bins):
+        bins_hint = _suggest_bins_for_min_per_bin(
+            n_treat=qc.n_treat,
+            n_control=qc.n_control,
+            bins_requested=int(args.bins),
+            min_per_bin=int(args.min_per_bin),
+        )
+        qc_payload["stratified_bins_hint"] = bins_hint
+
+        if bool(args.auto_bins):
+            bins_used = int(bins_hint["bins_suggested"])
     # Add legacy aliases for older tooling that expects sim/base keys.
     if group_col == "obs_source" and treat == "sim" and control == "base":
         qc_payload.setdefault("n_sim", qc.n_treat)
         qc_payload.setdefault("n_base", qc.n_control)
         qc_payload.setdefault("obstacles_hash_sim_unique", qc.obstacles_hash_treat_unique)
         qc_payload.setdefault("obstacles_hash_base_unique", qc.obstacles_hash_control_unique)
+        qc_payload.setdefault("scene_idx_sim_unique", qc.scene_idx_treat_unique)
+        qc_payload.setdefault("scene_idx_base_unique", qc.scene_idx_control_unique)
     (outdir / "qc_summary.json").write_text(
         json.dumps(qc_payload, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
 
-    # Randomization QC (per group)
-    rand_cols = [s.strip() for s in str(args.randomization_cols).split(",") if s.strip()]
-    rand_qc = randomization_qc(df, group_col=group_col, cols=rand_cols)
-    rand_qc.to_csv(outdir / "randomization_qc.csv", index=False)
+    # Randomization QC (per group) [opt-in]
+    if bool(args.do_rand_qc):
+        rand_cols = [s.strip() for s in str(args.randomization_cols).split(",") if s.strip()]
+        rand_qc = randomization_qc(df, group_col=group_col, cols=rand_cols)
+        rand_qc.to_csv(outdir / "randomization_qc.csv", index=False)
 
     # Layer-0
     layer0 = layer0_bootstrap_groups(
@@ -1144,94 +1628,117 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     layer0.to_csv(outdir / "layer0_summary.csv", index=False)
 
-    # Layer-0+
+    # Layer-0 (paired by scene_idx) [default on when available]
+    if (not bool(args.no_paired)) and ("scene_idx" in df.columns):
+        try:
+            layer0_p = layer0_paired_bootstrap_groups(
+                df,
+                group_col=group_col,
+                treat=treat,
+                control=control,
+                pair_col="scene_idx",
+                n_boot=int(args.n_boot),
+                seed=int(args.seed) + 999,
+            )
+            layer0_p.to_csv(outdir / "layer0_paired_summary.csv", index=False)
+        except Exception as e:
+            # Keep the default workflow robust.
+            (outdir / "layer0_paired_summary.csv").write_text(
+                f"paired Layer-0 skipped: {type(e).__name__}: {e}\n",
+                encoding="utf-8",
+            )
+
+    # Layer-0+ [opt-in]
     reg_info = {}
-    try:
-        reg_info = layer0plus_regression_groups(
+    if bool(args.do_layer0plus):
+        try:
+            reg_info = layer0plus_regression_groups(
+                df,
+                group_col=group_col,
+                treat=treat,
+                control=control,
+                out_txt_path=outdir / "layer0plus_regression.txt",
+            )
+        except RuntimeError as e:
+            # Write a helpful message but still succeed overall.
+            (outdir / "layer0plus_regression.txt").write_text(
+                f"Layer-0+ skipped: {e}\n", encoding="utf-8"
+            )
+
+    # Stratified [opt-in]
+    if bool(args.do_strat):
+        strat_cols = [s.strip() for s in str(args.strat_cols).split(",") if s.strip()]
+        strat = stratified_effects_groups(
             df,
             group_col=group_col,
             treat=treat,
             control=control,
-            out_txt_path=outdir / "layer0plus_regression.txt",
+            strat_cols=strat_cols,
+            n_bins=int(bins_used),
+            min_per_bin=int(args.min_per_bin),
+            n_boot=int(args.n_boot_strat),
+            seed=int(args.seed) + 12345,
         )
-    except RuntimeError as e:
-        # Write a helpful message but still succeed overall.
-        (outdir / "layer0plus_regression.txt").write_text(
-            f"Layer-0+ skipped: {e}\n", encoding="utf-8"
-        )
+        strat.to_csv(outdir / "stratified_effects.csv", index=False)
 
-    # Stratified
-    strat_cols = [s.strip() for s in str(args.strat_cols).split(",") if s.strip()]
-    strat = stratified_effects_groups(
-        df,
-        group_col=group_col,
-        treat=treat,
-        control=control,
-        strat_cols=strat_cols,
-        n_bins=int(bins_used),
-        min_per_bin=int(args.min_per_bin),
-        n_boot=int(args.n_boot_strat),
-        seed=int(args.seed) + 12345,
-    )
-    strat.to_csv(outdir / "stratified_effects.csv", index=False)
+        if not args.no_plots:
+            plot_stratified_effects(strat, out_path=outdir / "plots_stratified.png")
 
-    if not args.no_plots:
-        plot_stratified_effects(strat, out_path=outdir / "plots_stratified.png")
+    # Within-group attribution + sensitivity [opt-in]
+    if bool(args.do_attrib):
+        attrib_group = _safe_str(args.attrib_group) or str(treat)
+        attrib_group_safe = _sanitize_filename_component(attrib_group) or "attrib"
+        if attrib_group not in set(df[group_col].astype(str).unique().tolist()):
+            print(f"[warn] attrib group '{attrib_group}' not found in column '{group_col}'; skipping attribution")
+        else:
+            df_attrib = df[df[group_col].astype(str) == str(attrib_group)].copy()
+            outcome = _safe_str(args.attrib_outcome) or "collision"
+            outcome_safe = _sanitize_filename_component(outcome) or "outcome"
+            param_cols = [s.strip() for s in str(args.attrib_param_cols).split(",") if s.strip()]
+            control_cols = [s.strip() for s in str(args.attrib_control_cols).split(",") if s.strip()]
 
-    # Within-group attribution + sensitivity (recommended: randomized/treat group only)
-    attrib_group = _safe_str(args.attrib_group) or str(treat)
-    attrib_group_safe = _sanitize_filename_component(attrib_group) or "attrib"
-    if attrib_group not in set(df[group_col].astype(str).unique().tolist()):
-        print(f"[warn] attrib group '{attrib_group}' not found in column '{group_col}'; skipping attribution")
-    else:
-        df_attrib = df[df[group_col].astype(str) == str(attrib_group)].copy()
-        outcome = _safe_str(args.attrib_outcome) or "collision"
-        outcome_safe = _sanitize_filename_component(outcome) or "outcome"
-        param_cols = [s.strip() for s in str(args.attrib_param_cols).split(",") if s.strip()]
-        control_cols = [s.strip() for s in str(args.attrib_control_cols).split(",") if s.strip()]
-
-        # Logit attribution
-        try:
-            coef = attribution_logit_within_group(
-                df_attrib,
-                outcome_col=outcome,
-                param_cols=param_cols,
-                control_cols=control_cols,
-                use_log_params=bool(args.attrib_log_params),
-                out_txt_path=outdir / f"attribution_logit_{attrib_group_safe}_{outcome_safe}.txt",
-            )
-            coef.to_csv(outdir / f"attribution_logit_{attrib_group_safe}_{outcome_safe}_coef.csv", index=False)
-        except RuntimeError as e:
-            (outdir / f"attribution_logit_{attrib_group_safe}_{outcome_safe}.txt").write_text(
-                f"Attribution logit skipped: {e}\n",
-                encoding="utf-8",
-            )
-
-        # Binned sensitivity tables (shape sanity check)
-        if bool(args.bins_params):
-            metrics = [
-                "success_rate",
-                "collision_rate",
-                "time_to_goal_sec_success_mean",
-                "path_efficiency_mean",
-                "action_saturation_rate_mean",
-            ]
-            all_bins: List[pd.DataFrame] = []
-            for pc in param_cols:
-                tab = binned_sensitivity_table(
+            # Logit attribution
+            try:
+                coef = attribution_logit_within_group(
                     df_attrib,
-                    param_col=pc,
-                    n_bins=int(args.bins),
-                    metrics=metrics,
+                    outcome_col=outcome,
+                    param_cols=param_cols,
+                    control_cols=control_cols,
+                    use_log_params=bool(args.attrib_log_params),
+                    out_txt_path=outdir / f"attribution_logit_{attrib_group_safe}_{outcome_safe}.txt",
                 )
-                if not tab.empty:
-                    tab.insert(0, "group", attrib_group)
-                    all_bins.append(tab)
-            if all_bins:
-                pd.concat(all_bins, axis=0, ignore_index=True).to_csv(
-                    outdir / f"sensitivity_bins_{attrib_group_safe}.csv",
-                    index=False,
+                coef.to_csv(outdir / f"attribution_logit_{attrib_group_safe}_{outcome_safe}_coef.csv", index=False)
+            except RuntimeError as e:
+                (outdir / f"attribution_logit_{attrib_group_safe}_{outcome_safe}.txt").write_text(
+                    f"Attribution logit skipped: {e}\n",
+                    encoding="utf-8",
                 )
+
+            # Binned sensitivity tables
+            if bool(args.bins_params):
+                metrics = [
+                    "success_rate",
+                    "collision_rate",
+                    "time_to_goal_sec_success_mean",
+                    "path_efficiency_mean",
+                    "action_saturation_rate_mean",
+                ]
+                all_bins: List[pd.DataFrame] = []
+                for pc in param_cols:
+                    tab = binned_sensitivity_table(
+                        df_attrib,
+                        param_col=pc,
+                        n_bins=int(args.bins),
+                        metrics=metrics,
+                    )
+                    if not tab.empty:
+                        tab.insert(0, "group", attrib_group)
+                        all_bins.append(tab)
+                if all_bins:
+                    pd.concat(all_bins, axis=0, ignore_index=True).to_csv(
+                        outdir / f"sensitivity_bins_{attrib_group_safe}.csv",
+                        index=False,
+                    )
 
     # Console summary
     treat_rate = (
@@ -1247,31 +1754,56 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     print("== QC ==")
     print(f"rows: total={qc.n_total} {treat}={qc.n_treat} {control}={qc.n_control}")
-    print(
-        "obstacles_hash: treat_unique={} control_unique={} intersection={} pair_ub={}".format(
-            qc.obstacles_hash_treat_unique,
-            qc.obstacles_hash_control_unique,
-            qc.obstacles_hash_intersection,
-            qc.obstacles_hash_pair_upper_bound,
-        )
-    )
-    print("success rate: {}={} {}={}".format(treat, _pct(treat_rate), control, _pct(control_rate)))
-    print(
-        "stratified bins: requested={} used={} min_per_bin={} suggested_max={} suggested_bins={}{}".format(
-            int(args.bins),
-            int(bins_used),
-            int(args.min_per_bin),
-            int(bins_hint["max_bins"]),
-            int(bins_hint["bins_suggested"]),
-            " (auto)" if bool(args.auto_bins) else "",
-        )
-    )
-    if int(bins_used) > int(bins_hint["max_bins"]) and int(bins_hint["max_bins"]) >= 2:
+    if qc.scene_idx_intersection > 0:
         print(
-            "[warn] --bins may be too fine for --min-per-bin; consider: --bins {} (or use --auto-bins)".format(
-                int(bins_hint["bins_suggested"])
+            "scene_idx: treat_unique={} control_unique={} intersection={} pair_ub={}".format(
+                qc.scene_idx_treat_unique,
+                qc.scene_idx_control_unique,
+                qc.scene_idx_intersection,
+                qc.scene_idx_pair_upper_bound,
             )
         )
+    if np.isfinite(qc.obstacles_hash_match_rate_treat) or np.isfinite(qc.obstacles_hash_match_rate_control):
+        print(
+            "obstacles_hash_match_rate: {}={:.1f}% {}={:.1f}%".format(
+                treat,
+                100.0 * float(qc.obstacles_hash_match_rate_treat) if np.isfinite(qc.obstacles_hash_match_rate_treat) else float("nan"),
+                control,
+                100.0 * float(qc.obstacles_hash_match_rate_control) if np.isfinite(qc.obstacles_hash_match_rate_control) else float("nan"),
+            )
+        )
+
+    if "steps_to_goal" in df.columns and "success" in df.columns:
+        print(
+            "steps_to_goal missing≈failures: {} missing={} failures={} (Δ={}) | {} missing={} failures={} (Δ={})".format(
+                treat,
+                int(qc.steps_to_goal_missing_treat),
+                int(qc.steps_to_goal_failures_treat),
+                int(qc.steps_to_goal_missing_minus_failures_treat),
+                control,
+                int(qc.steps_to_goal_missing_control),
+                int(qc.steps_to_goal_failures_control),
+                int(qc.steps_to_goal_missing_minus_failures_control),
+            )
+        )
+    print("success rate: {}={} {}={}".format(treat, _pct(treat_rate), control, _pct(control_rate)))
+    if bool(args.do_strat) and bins_hint:
+        print(
+            "stratified bins: requested={} used={} min_per_bin={} suggested_max={} suggested_bins={}{}".format(
+                int(args.bins),
+                int(bins_used),
+                int(args.min_per_bin),
+                int(bins_hint["max_bins"]),
+                int(bins_hint["bins_suggested"]),
+                " (auto)" if bool(args.auto_bins) else "",
+            )
+        )
+        if int(bins_used) > int(bins_hint["max_bins"]) and int(bins_hint["max_bins"]) >= 2:
+            print(
+                "[warn] --bins may be too fine for --min-per-bin; consider: --bins {} (or use --auto-bins)".format(
+                    int(bins_hint["bins_suggested"])
+                )
+            )
     if reg_info:
         print(f"Layer-0+ success OR ({treat} vs {control}):", reg_info.get("success_or_treat"))
     print("Outputs written to:", outdir)

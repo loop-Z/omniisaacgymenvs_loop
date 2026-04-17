@@ -53,8 +53,10 @@ sysid:
   print_latent_stats: True
   # History length used by id_encoder
   history_len: 50
-  # Privileged tail dim (mass+CoM) used by the task observation
-  mass_dim: 4
+  # Privileged tail dim used by the task observation
+  # 4: [mass, com(x,y,z)]
+  # 8: [mass, com(x,y,z), k_drag, thr_L, thr_R, k_Iz]
+  mass_dim: 8
 
 # disables rendering
 headless: False

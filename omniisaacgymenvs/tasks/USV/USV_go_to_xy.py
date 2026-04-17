@@ -38,8 +38,9 @@ class GoToXYTask(Core):
         reward_param: GoToXYReward,
         num_envs: int,
         device: str,
+        priv_dim: int = 4,
     ) -> None:
-        super(GoToXYTask, self).__init__(num_envs, device)
+        super(GoToXYTask, self).__init__(num_envs, device, action_dim=2, priv_dim=priv_dim)
         # Task and reward parameters
         self._task_parameters = parse_data_dict(GoToXYParameters(), task_param)
         self._reward_parameters = parse_data_dict(GoToXYReward(), reward_param)
@@ -87,6 +88,7 @@ class GoToXYTask(Core):
         mass: torch.Tensor = None,
         com: torch.Tensor = None,
         prev_action: torch.Tensor = None,
+        priv_tail: torch.Tensor = None,
     ) -> torch.Tensor:
         """
         Computes the observation tensor from the current state of the robot."""
@@ -109,7 +111,14 @@ class GoToXYTask(Core):
         self._task_data[:, 2] = torch.norm(self._position_error, dim=1)
         # Debug : print the task data
         # print(f"self._task_data: {self._task_data}")
-        return self.update_observation_tensor(current_state, observation_frame, mass, com, prev_action)
+        return self.update_observation_tensor(
+            current_state,
+            observation_frame,
+            mass,
+            com,
+            prev_action,
+            priv_tail=priv_tail,
+        )
 
     def compute_reward(
         self, current_state: torch.Tensor, actions: torch.Tensor

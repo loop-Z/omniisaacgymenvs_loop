@@ -7,7 +7,8 @@ environment:
   # 速度信息：线速度(2) + 角速度(1)
   speed_dim: 3
   # 质量质心：mass(1) + CoM(x,y,z)
-  mass_dim: 4
+  # Extended privileged tail: mass+CoM + (k_drag, thr_L, thr_R, k_Iz)
+  mass_dim: 8
   control_dt: 0.01
   max_time: 6.0
   eval_every_n: 2000
@@ -35,7 +36,7 @@ architecture:
   layer_type: feedforward
   activation: tanh
   small_init: false
-
+  mass_skip_dim: 4
   # ---- USV：质量/质心编码器超参（可选）----
   # mass_encoder 会先把 [mass, com] 编码为 latent，再与 speed/task 拼接送入主干 MLP
   mass_latent_dim: 8

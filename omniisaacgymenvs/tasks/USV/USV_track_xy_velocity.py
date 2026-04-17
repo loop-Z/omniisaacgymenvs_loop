@@ -32,8 +32,8 @@ class TrackXYVelocityTask(Core):
     Implements the TrackXYVelocity task. The robot has to reach a target linear velocity.
     """
 
-    def __init__(self, task_param, reward_param, num_envs, device):
-        super(TrackXYVelocityTask, self).__init__(num_envs, device)
+    def __init__(self, task_param, reward_param, num_envs, device, priv_dim: int = 4):
+        super(TrackXYVelocityTask, self).__init__(num_envs, device, action_dim=2, priv_dim=priv_dim)
         # Task and reward parameters
         self._task_parameters = parse_data_dict(TrackXYVelocityParameters(), task_param)
         self._reward_parameters = parse_data_dict(TrackXYVelocityReward(), reward_param)
@@ -68,6 +68,7 @@ class TrackXYVelocityTask(Core):
         mass: torch.Tensor = None,
         com: torch.Tensor = None,
         prev_action: torch.Tensor = None,
+        priv_tail: torch.Tensor = None,
     ) -> torch.Tensor:
         """
         Computes the observation tensor from the current state of the robot."""
@@ -77,7 +78,14 @@ class TrackXYVelocityTask(Core):
         )
         self._position_error = current_state["position"]
         self._task_data[:, :2] = self._velocity_error
-        return self.update_observation_tensor(current_state, observation_frame, mass, com, prev_action)
+        return self.update_observation_tensor(
+            current_state,
+            observation_frame,
+            mass,
+            com,
+            prev_action,
+            priv_tail=priv_tail,
+        )
 
     def compute_reward(
         self, current_state: torch.Tensor, actions: torch.Tensor

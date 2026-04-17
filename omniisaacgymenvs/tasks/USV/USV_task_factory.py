@@ -38,7 +38,12 @@ class TaskFactory:
         self.creators[name] = task
 
     def get(
-        self, task_dict: dict, reward_dict: dict, num_envs: int, device: str
+        self,
+        task_dict: dict,
+        reward_dict: dict,
+        num_envs: int,
+        device: str,
+        priv_dim: int = 4,
     ) -> object:
         """
         Returns a task."""
@@ -47,7 +52,7 @@ class TaskFactory:
         ), "The mode of both the task and the reward must match."
         mode = task_dict["name"]
         assert task_dict["name"] in self.creators.keys(), "Unknown task mode."
-        return self.creators[mode](task_dict, reward_dict, num_envs, device)
+        return self.creators[mode](task_dict, reward_dict, num_envs, device, priv_dim=priv_dim)
 
 
 task_factory = TaskFactory()

@@ -40,7 +40,7 @@ class CaptureXYTask(Core):
         reward_param: CaptureXYReward,
         num_envs: int,
         device: str,
-        priv_dim: int = 8,
+        priv_dim: int = 4,
     ) -> None:
         super(CaptureXYTask, self).__init__(num_envs, device, action_dim=2, priv_dim=priv_dim)
         # Task and reward parameters
@@ -160,8 +160,6 @@ class CaptureXYTask(Core):
             stats["goal_reward"] = torch_zeros()
         if "collision_reward" not in stats.keys():
             stats["collision_reward"] = torch_zeros()
-        if "time_reward" not in stats.keys():
-            stats["time_reward"] = torch_zeros()
 
         # ---------------- Episode outcome events (0/1 per episode) ----------------
         if "success" not in stats.keys():
@@ -622,12 +620,6 @@ class CaptureXYTask(Core):
 
         # Save position_dist for next calculation
         self.prev_position_dist = self.position_dist
-
-        # Cache per-step time reward for episode logging.
-        # Stored as a per-env tensor so update_statistics() can accumulate it.
-        self._time_reward = torch.full_like(
-            self.position_dist, float(self._task_parameters.time_reward)
-        )
         
         total_reward = (
                     self.distance_reward * 0.5
@@ -635,7 +627,7 @@ class CaptureXYTask(Core):
                     + self.potential_shaping_reward * 2.0  # 如果你取消了注释，记得在这里加上
                     + turn_hazard_penalty
                     + goal_reward
-                    + self._task_parameters.time_reward
+                    # + self._task_parameters.time_reward
                     + self.collision_penalty
                     + speed_reward
                     + angular_reward
@@ -743,8 +735,6 @@ class CaptureXYTask(Core):
             _add_if_present("turn_hazard_penalty", self._turn_hazard_penalty)
         if hasattr(self, "_goal_reward"):
             _add_if_present("goal_reward", self._goal_reward)
-        if hasattr(self, "_time_reward"):
-            _add_if_present("time_reward", self._time_reward)
         if hasattr(self, "collision_reward"):
             _add_if_present("collision_reward", self.collision_reward)
 

@@ -161,16 +161,42 @@ def parse_hydra_configs(cfg: DictConfig):
     output_activation_fn = activation_fn_map[cfg['architecture']['activation']]
     # 从配置中获取小初始化标志
     small_init_flag = cfg['architecture']['small_init']
-    # USV 观测协议：速度维度与质量质心维度（优先从 cfg.yaml 读取；缺省为 3/4）
+    # USV 观测协议：速度维度与特权尾部维度
     # speed_dim = 2 (linear vel) + 1 (angular vel)
-    # mass_dim  = 1 (mass) + 3 (CoM)
-    speed_dim = int(cfg['environment'].get('speed_dim', 3))
-    mass_dim = int(cfg['environment'].get('mass_dim', 4))
+    # priv/mass_dim (tail) = 4: [mass, com(x,y,z)]
+    # priv/mass_dim (tail) = 8: [mass, com(x,y,z), k_drag, thr_L, thr_R, k_Iz]
+    # IMPORTANT: 本脚本会 merge legacy overrides (IROS2024/cfg.yaml) 到 cfg.environment。
+    # 这可能覆盖 task.yaml 的 task.env.mass_dim，导致网络切片与环境输出不一致。
+    speed_dim = int(cfg["environment"].get("speed_dim", 3))
+
+    mass_dim_env = int(cfg["environment"].get("mass_dim", 4))
+    mass_dim_task = None
+    try:
+        # Prefer explicit priv_dim if present, otherwise fall back to legacy mass_dim.
+        mass_dim_task = cfg.task.env.get("priv_dim", cfg.task.env.get("mass_dim", None))
+        mass_dim_task = int(mass_dim_task) if mass_dim_task is not None else None
+    except Exception:
+        mass_dim_task = None
+
+    mass_dim = int(mass_dim_task) if mass_dim_task is not None else int(mass_dim_env)
+
+    if rank == 0 and mass_dim_task is not None and int(mass_dim_task) != int(mass_dim_env):
+        print(
+            f"[loopz][WARN] mass_dim mismatch: task.env.mass_dim/priv_dim={int(mass_dim_task)} "
+            f"but environment.mass_dim={int(mass_dim_env)} (legacy override). "
+            f"Using mass_dim={int(mass_dim)} for network slicing."
+        )
 
     # 质量/质心编码器超参（可选）：latent 维度与隐藏层结构
     # - mass_latent_dim: mass encoder 输出维度
     # - mass_encoder_shape: mass encoder 隐藏层，例如 [64, 16]
     mass_latent_dim = int(cfg['architecture'].get('mass_latent_dim', 8))
+    # Optional: skip-connection of raw mass/com into the main MLP.
+    # Typical for fastest conditioning test: mass_skip_dim=4.
+    # try:
+    #     mass_skip_dim = int(cfg['architecture'].get('mass_skip_dim', 0) or 0)
+    # except Exception:
+    #     mass_skip_dim = 0
     _mass_encoder_shape_cfg = cfg['architecture'].get('mass_encoder_shape', [64, 16])
     if _mass_encoder_shape_cfg is None:
         mass_encoder_shape = (64, 16)
@@ -216,12 +242,471 @@ def parse_hydra_configs(cfg: DictConfig):
     env.reset()
     obs = env.observe(False)
 
-
-    # TODO:这里要处理
+    # NOTE: define obs/action dims BEFORE any optional debug printing that may use them.
     # 获取观察空间维度
     ob_dim = env.num_obs
     # 获取动作空间维度
     act_dim = env.num_acts
+
+    # ---------------- Debug printing: obs segment statistics & privileged params ----------------
+    # Controls:
+    # - LOOPZ_PRINT_PRIV=1 : prints priv_tail stats (legacy)
+    # - LOOPZ_PRINT_OBS=1  : prints full obs segment stats (defaults to LOOPZ_PRINT_PRIV)
+    # - LOOPZ_PRINT_OBS_EVERY=50 : print summary every N updates
+    # - LOOPZ_EP_CONST_CHECK=1 : sample env0 at step0/mid/last within debug updates
+    _dbg_print_priv = os.getenv("LOOPZ_PRINT_PRIV", "0") in ("1", "true", "True")
+    _dbg_print_obs = os.getenv("LOOPZ_PRINT_OBS", os.getenv("LOOPZ_PRINT_PRIV", "0")) in (
+        "1",
+        "true",
+        "True",
+    )
+    try:
+        _dbg_every = int(os.getenv("LOOPZ_PRINT_OBS_EVERY", "50"))
+    except Exception:
+        _dbg_every = 50
+    _dbg_ep_const = os.getenv("LOOPZ_EP_CONST_CHECK", "1") in ("1", "true", "True")
+
+    # Policy-level debug: sensitivity to priv_tail + latent stats.
+    # - LOOPZ_POLICY_SENS=1 : run action/value sensitivity tests wrt privileged tail
+    # - LOOPZ_PRINT_LATENT=1 : print mass_encoder latent stats
+    # - LOOPZ_POLICY_SENS_N=64 : batch size (subset of envs) used for tests
+    # - LOOPZ_POLICY_SENS_EVERY=50 : log policy_sens stats/* scalars every N updates (0 disables)
+    # - LOOPZ_POLICY_SENS_PRINT=1 : whether to print policy_sens summaries when computed
+    _dbg_policy_sens = os.getenv("LOOPZ_POLICY_SENS", "1") in ("1", "true", "True")
+    _dbg_print_latent = os.getenv("LOOPZ_PRINT_LATENT", "1") in ("1", "true", "True")
+    try:
+        _dbg_policy_n = int(os.getenv("LOOPZ_POLICY_SENS_N", "64"))
+    except Exception:
+        _dbg_policy_n = 64
+    try:
+        _dbg_policy_every = int(os.getenv("LOOPZ_POLICY_SENS_EVERY", "10"))
+    except Exception:
+        _dbg_policy_every = 50
+    _dbg_policy_print = os.getenv("LOOPZ_POLICY_SENS_PRINT", "1") in ("1", "true", "True")
+
+    # Observation clipping bound (used only for diagnostics).
+    try:
+        _clip_obs_val = float(cfg.task.env.clipObservations.get("state", 12.0))
+    except Exception:
+        _clip_obs_val = 12.0
+
+    def _seg_slices(obs_dim: int, speed_dim: int, act_dim: int, mass_dim: int):
+        prev_action_dim = int(act_dim)
+        task_dim = int(obs_dim - int(speed_dim) - prev_action_dim - int(mass_dim))
+        if task_dim < 0:
+            raise ValueError(
+                f"Invalid obs split: obs_dim={obs_dim} speed_dim={speed_dim} act_dim={act_dim} mass_dim={mass_dim}"
+            )
+        i0 = 0
+        i1 = int(speed_dim)
+        i2 = i1 + task_dim
+        i3 = i2 + prev_action_dim
+        i4 = i3 + int(mass_dim)
+        return {
+            "speed": (i0, i1),
+            "task_rest": (i1, i2),
+            "prev_action": (i2, i3),
+            "priv_tail": (i3, i4),
+        }
+
+    def _stats_np(x: np.ndarray, *, clip_val=None):
+        x = np.asarray(x)
+        finite = np.isfinite(x)
+        nonfinite = int(np.size(x) - int(np.sum(finite)))
+        if np.any(finite):
+            xf = x[finite]
+            mean = float(np.mean(xf))
+            std = float(np.std(xf))
+            vmin = float(np.min(xf))
+            vmax = float(np.max(xf))
+        else:
+            mean, std, vmin, vmax = float("nan"), float("nan"), float("nan"), float("nan")
+        clip_ratio = None
+        if clip_val is not None and np.size(x) > 0:
+            clip_ratio = float(np.mean(np.abs(np.nan_to_num(x, nan=0.0)) >= (clip_val - 1e-6)))
+        return {
+            "mean": mean,
+            "std": std,
+            "min": vmin,
+            "max": vmax,
+            "nonfinite": nonfinite,
+            "clip_ratio": clip_ratio,
+        }
+
+    def _get_raw_priv_params(task_obj):
+        """Return raw episode-wise params (k_drag/thr_L/thr_R/k_Iz) on CPU as numpy arrays.
+
+        This is for debugging only. Values are expected to be shape (num_envs, 1).
+        """
+
+        if task_obj is None:
+            return None
+        if int(mass_dim) != 8:
+            return None
+
+        ones = None
+        try:
+            ones = torch.ones((env.num_envs, 1), device=getattr(task_obj, "_device", "cpu"), dtype=torch.float32)
+        except Exception:
+            ones = None
+
+        # k_drag
+        k_drag_t = None
+        try:
+            hd = getattr(task_obj, "hydrodynamics", None)
+            if hd is not None and hasattr(hd, "drag_scale"):
+                k_drag_t = getattr(hd, "drag_scale")
+        except Exception:
+            k_drag_t = None
+        if k_drag_t is None and ones is not None:
+            k_drag_t = ones
+
+        # thr_L / thr_R
+        thr_l_t = None
+        thr_r_t = None
+        try:
+            td = getattr(task_obj, "thrusters_dynamics", None)
+            if td is not None:
+                if getattr(td, "_use_separate_randomization", False):
+                    thr_l_t = getattr(td, "thruster_left_multiplier", None)
+                    thr_r_t = getattr(td, "thruster_right_multiplier", None)
+                else:
+                    thr = getattr(td, "thruster_multiplier", None)
+                    thr_l_t = thr
+                    thr_r_t = thr
+        except Exception:
+            thr_l_t = None
+            thr_r_t = None
+        if thr_l_t is None and ones is not None:
+            thr_l_t = ones
+        if thr_r_t is None and ones is not None:
+            thr_r_t = ones
+
+        # k_Iz
+        k_iz_t = None
+        try:
+            if hasattr(task_obj, "k_Iz"):
+                k_iz_t = getattr(task_obj, "k_Iz")
+        except Exception:
+            k_iz_t = None
+        if k_iz_t is None and ones is not None:
+            k_iz_t = ones
+
+        out = {}
+        for name, t in ("k_drag", k_drag_t), ("thr_L", thr_l_t), ("thr_R", thr_r_t), ("k_Iz", k_iz_t):
+            if t is None:
+                continue
+            try:
+                if torch.is_tensor(t):
+                    out[name] = t.detach().to("cpu").float().numpy()
+                else:
+                    out[name] = np.asarray(t, dtype=np.float32)
+            except Exception:
+                continue
+        return out if len(out) > 0 else None
+
+    def _print_obs_debug(obs_np: np.ndarray, *, header: str) -> None:
+        if not isinstance(obs_np, np.ndarray) or obs_np.ndim != 2:
+            print(f"[loopz] {header}: obs debug skipped (shape={getattr(obs_np, 'shape', None)})")
+            return
+
+        obs_dim_local = int(obs_np.shape[1])
+        splits = _seg_slices(obs_dim_local, int(speed_dim), int(act_dim), int(mass_dim))
+
+        # Whole-obs summary
+        st_all = _stats_np(obs_np, clip_val=_clip_obs_val)
+        print(
+            f"[loopz] {header}: obs(all) mean={st_all['mean']:.4g} std={st_all['std']:.4g} "
+            f"min={st_all['min']:.4g} max={st_all['max']:.4g} nonfinite={st_all['nonfinite']} "
+            f"clip@{_clip_obs_val:g}={st_all['clip_ratio']:.3g}"
+        )
+
+        for seg_name in ("speed", "task_rest", "prev_action", "priv_tail"):
+            a, b = splits[seg_name]
+            seg = obs_np[:, a:b]
+            st = _stats_np(seg, clip_val=_clip_obs_val)
+            print(
+                f"[loopz] {header}: obs({seg_name}) idx=[{a}:{b}) dim={b-a} "
+                f"mean={st['mean']:.4g} std={st['std']:.4g} min={st['min']:.4g} max={st['max']:.4g} "
+                f"nonfinite={st['nonfinite']} clip@{_clip_obs_val:g}={st['clip_ratio']:.3g}"
+            )
+
+        # Per-dim stats for priv tail (encoded) + names
+        a, b = splits["priv_tail"]
+        tail = obs_np[:, a:b]
+        if tail.shape[1] == 4:
+            names = ["mass", "com_x", "com_y", "com_z"]
+        elif tail.shape[1] == 8:
+            names = ["mass", "com_x", "com_y", "com_z", "k_drag", "thr_L", "thr_R", "k_Iz"]
+        else:
+            names = [f"d{i}" for i in range(tail.shape[1])]
+        for i, n in enumerate(names):
+            sti = _stats_np(tail[:, i])
+            print(
+                f"[loopz] {header}: priv_tail[{i}:{n}] mean={sti['mean']:.4g} std={sti['std']:.4g} "
+                f"min={sti['min']:.4g} max={sti['max']:.4g} nonfinite={sti['nonfinite']}"
+            )
+
+        # Raw episode-wise params (if available)
+        raw = _get_raw_priv_params(getattr(env, "_task", None))
+        if raw is not None:
+            for k in ("k_drag", "thr_L", "thr_R", "k_Iz"):
+                if k not in raw:
+                    continue
+                st = _stats_np(raw[k])
+                print(
+                    f"[loopz] {header}: raw({k}) mean={st['mean']:.4g} std={st['std']:.4g} "
+                    f"min={st['min']:.4g} max={st['max']:.4g} nonfinite={st['nonfinite']}"
+                )
+
+
+    def _print_policy_sensitivity_debug(obs_np: np.ndarray, *, header: str):
+        """Diagnose whether the current policy/critic actually uses the privileged tail.
+
+        This runs a few no-grad forward passes:
+        - zero all priv_tail dims
+        - permute priv_tail across batch
+        - zero each priv_tail dim individually
+        and reports mean absolute action delta (after tanh squash) + value delta.
+        Also prints mass_encoder latent stats if available.
+        """
+
+        if not isinstance(obs_np, np.ndarray) or obs_np.ndim != 2 or obs_np.shape[0] < 1:
+            return None
+        if int(mass_dim) <= 0:
+            return None
+
+        # Take a small batch across envs to capture variation.
+        n = int(min(int(_dbg_policy_n), int(obs_np.shape[0])))
+        if n < 2:
+            return None
+
+        device = torch.device(device_type)
+        obs_t = torch.from_numpy(obs_np[:n]).to(device=device, dtype=torch.float32)
+
+        # Resolve policy/critic nets (MLPEncode instances).
+        policy_net = getattr(getattr(actor, "architecture", None), "architecture", None)
+        critic_net = getattr(getattr(critic, "architecture", None), "architecture", None)
+        if policy_net is None or critic_net is None:
+            if _dbg_policy_print:
+                print(f"[loopz] {header}: policy_sens skipped (no policy/critic net)")
+            return None
+
+        priv_start = int(obs_t.shape[1] - int(mass_dim))
+        if priv_start < 0:
+            if _dbg_policy_print:
+                print(f"[loopz] {header}: policy_sens skipped (obs_dim={obs_t.shape[1]} mass_dim={mass_dim})")
+            return None
+
+        if int(mass_dim) == 4:
+            names = ["mass", "com_x", "com_y", "com_z"]
+        elif int(mass_dim) == 8:
+            names = ["mass", "com_x", "com_y", "com_z", "k_drag", "thr_L", "thr_R", "k_Iz"]
+        else:
+            names = [f"d{i}" for i in range(int(mass_dim))]
+
+        # Convert action scale to a tensor for squashing.
+        try:
+            scale_t = torch.tensor(float(action_scale), device=device, dtype=torch.float32)
+        except Exception:
+            scale_t = torch.tensor(1.0, device=device, dtype=torch.float32)
+
+        def _squash(logits_t: torch.Tensor) -> torch.Tensor:
+            # SquashedGaussian uses tanh; scale can be scalar.
+            return torch.tanh(logits_t) * scale_t
+
+        with torch.no_grad():
+            logits_base = policy_net(obs_t)
+            act_base = _squash(logits_base)
+            v_base = critic_net(obs_t)
+
+            # Baseline scales for context.
+            a_abs = float(act_base.abs().mean().item())
+            logits_abs = float(logits_base.abs().mean().item())
+
+            # Zero all privileged dims.
+            obs_zero = obs_t.clone()
+            obs_zero[:, priv_start:] = 0.0
+            logits_zero = policy_net(obs_zero)
+            act_zero = _squash(logits_zero)
+            v_zero = critic_net(obs_zero)
+
+            da_zero = (act_base - act_zero).abs().mean().item()
+            dlogits_zero = (logits_base - logits_zero).abs().mean().item()
+            dv_zero = (v_base - v_zero).abs().mean().item()
+
+            # Permute privileged tail across batch (break correlation while staying in-distribution).
+            perm = torch.randperm(n, device=device)
+            obs_perm = obs_t.clone()
+            obs_perm[:, priv_start:] = obs_perm[perm, priv_start:]
+            logits_perm = policy_net(obs_perm)
+            act_perm = _squash(logits_perm)
+            v_perm = critic_net(obs_perm)
+            da_perm = (act_base - act_perm).abs().mean().item()
+            dv_perm = (v_base - v_perm).abs().mean().item()
+
+            # Group tests: mass+com (first 4) vs extras (remaining).
+            da_zero_masscom = None
+            da_perm_masscom = None
+            dv_zero_masscom = None
+            dv_perm_masscom = None
+            da_zero_extra = None
+            da_perm_extra = None
+            dv_zero_extra = None
+            dv_perm_extra = None
+
+            if int(mass_dim) >= 4:
+                obs_zm = obs_t.clone()
+                obs_zm[:, priv_start:priv_start + 4] = 0.0
+                logits_zm = policy_net(obs_zm)
+                act_zm = _squash(logits_zm)
+                v_zm = critic_net(obs_zm)
+                da_zero_masscom = float((act_base - act_zm).abs().mean().item())
+                dv_zero_masscom = float((v_base - v_zm).abs().mean().item())
+
+                obs_pm = obs_t.clone()
+                obs_pm[:, priv_start:priv_start + 4] = obs_pm[perm, priv_start:priv_start + 4]
+                logits_pm = policy_net(obs_pm)
+                act_pm = _squash(logits_pm)
+                v_pm = critic_net(obs_pm)
+                da_perm_masscom = float((act_base - act_pm).abs().mean().item())
+                dv_perm_masscom = float((v_base - v_pm).abs().mean().item())
+
+            if int(mass_dim) > 4:
+                obs_ze = obs_t.clone()
+                obs_ze[:, priv_start + 4:priv_start + int(mass_dim)] = 0.0
+                logits_ze = policy_net(obs_ze)
+                act_ze = _squash(logits_ze)
+                v_ze = critic_net(obs_ze)
+                da_zero_extra = float((act_base - act_ze).abs().mean().item())
+                dv_zero_extra = float((v_base - v_ze).abs().mean().item())
+
+                obs_pe = obs_t.clone()
+                obs_pe[:, priv_start + 4:priv_start + int(mass_dim)] = obs_pe[perm, priv_start + 4:priv_start + int(mass_dim)]
+                logits_pe = policy_net(obs_pe)
+                act_pe = _squash(logits_pe)
+                v_pe = critic_net(obs_pe)
+                da_perm_extra = float((act_base - act_pe).abs().mean().item())
+                dv_perm_extra = float((v_base - v_pe).abs().mean().item())
+
+            per_dim_da = []
+            per_dim_dz = []
+            # Latent stats (if mass_encoder exists).
+            mass_encoder = getattr(policy_net, "mass_encoder", None)
+            latent_base = None
+            if _dbg_print_latent and mass_encoder is not None:
+                try:
+                    mass_base = obs_t[:, priv_start:]
+                    latent_base = mass_encoder(mass_base)
+                    z_mean = float(latent_base.mean().item())
+                    z_std = float(latent_base.std(unbiased=False).item())
+                    z_min = float(latent_base.min().item())
+                    z_max = float(latent_base.max().item())
+                    print(
+                        f"[loopz] {header}: mass_latent(all) dim={int(latent_base.shape[1])} "
+                        f"mean={z_mean:.4g} std={z_std:.4g} min={z_min:.4g} max={z_max:.4g}"
+                    )
+                except Exception as _e:
+                    if _dbg_policy_print:
+                        print(f"[loopz] {header}: mass_latent failed: {_e}")
+
+            # Per-dim zero sensitivity.
+            for j in range(int(mass_dim)):
+                obs_j = obs_t.clone()
+                obs_j[:, priv_start + j] = 0.0
+                logits_j = policy_net(obs_j)
+                act_j = _squash(logits_j)
+                da_j = (act_base - act_j).abs().mean().item()
+                per_dim_da.append(float(da_j))
+
+                if latent_base is not None and mass_encoder is not None:
+                    try:
+                        mass_j = obs_j[:, priv_start:]
+                        latent_j = mass_encoder(mass_j)
+                        dz = (latent_base - latent_j).pow(2).sum(dim=1).sqrt().mean().item()
+                        per_dim_dz.append(float(dz))
+                    except Exception:
+                        per_dim_dz.append(float("nan"))
+
+            # Build a small dict of coupling metrics for TB/W&B monitoring.
+            per_dim_map = {k: float(v) for k, v in zip(names, per_dim_da)}
+            out = {
+                "zero_all_dA": float(da_zero),
+                "masscom_zero_dA": float(da_zero_masscom) if da_zero_masscom is not None else float("nan"),
+                "extra_zero_dA": float(da_zero_extra) if da_zero_extra is not None else float("nan"),
+                "per_dim_zero_dA/k_Iz": float(per_dim_map.get("k_Iz", float("nan"))),
+                "per_dim_zero_dA/thr_L": float(per_dim_map.get("thr_L", float("nan"))),
+                "per_dim_zero_dA/thr_R": float(per_dim_map.get("thr_R", float("nan"))),
+            }
+
+            # Print summaries.
+            if _dbg_policy_print:
+                print(
+                    f"[loopz] {header}: policy_sens n={n} priv_dim={int(mass_dim)} "
+                    f"base mean|a|={a_abs:.4g} mean|logits|={logits_abs:.4g} "
+                    f"zero_all mean|Δa|={da_zero:.4g} mean|Δlogits|={dlogits_zero:.4g} mean|ΔV|={dv_zero:.4g} "
+                    f"perm_priv mean|Δa|={da_perm:.4g} mean|ΔV|={dv_perm:.4g}"
+                )
+
+                if da_zero_masscom is not None:
+                    print(
+                        f"[loopz] {header}: policy_sens group masscom "
+                        f"zero mean|Δa|={da_zero_masscom:.4g} mean|ΔV|={float(dv_zero_masscom):.4g} "
+                        f"perm mean|Δa|={float(da_perm_masscom):.4g} mean|ΔV|={float(dv_perm_masscom):.4g}"
+                    )
+                if da_zero_extra is not None:
+                    print(
+                        f"[loopz] {header}: policy_sens group extra "
+                        f"zero mean|Δa|={float(da_zero_extra):.4g} mean|ΔV|={float(dv_zero_extra):.4g} "
+                        f"perm mean|Δa|={float(da_perm_extra):.4g} mean|ΔV|={float(dv_perm_extra):.4g}"
+                    )
+
+                da_pairs = list(zip(names, per_dim_da))
+                da_pairs_sorted = sorted(da_pairs, key=lambda x: x[1], reverse=True)
+                da_str = ", ".join([f"{k}={v:.3g}" for k, v in da_pairs_sorted])
+                print(f"[loopz] {header}: policy_sens per_dim_zero mean|Δa|: {da_str}")
+
+                if len(per_dim_dz) == int(mass_dim):
+                    dz_pairs = list(zip(names, per_dim_dz))
+                    dz_pairs_sorted = sorted(dz_pairs, key=lambda x: (-(0.0 if np.isnan(x[1]) else x[1])))
+                    dz_str = ", ".join([f"{k}={v:.3g}" for k, v in dz_pairs_sorted])
+                    print(f"[loopz] {header}: policy_sens per_dim_zero mean||Δz||2: {dz_str}")
+
+            return out
+
+
+    # Optional: initial sanity checks (printed once after reset).
+    if (_dbg_print_priv or _dbg_print_obs) and rank == 0:
+        try:
+            md = int(mass_dim)
+            if isinstance(obs, np.ndarray) and obs.ndim == 2 and obs.shape[1] >= md:
+                tail = obs[:, -md:]
+                tail_mean = np.mean(tail, axis=0)
+                tail_std = np.std(tail, axis=0)
+                tail_min = np.min(tail, axis=0)
+                tail_max = np.max(tail, axis=0)
+                print(
+                    f"[loopz] priv_tail sanity: mass_dim={md} obs_dim={obs.shape[1]} "
+                    f"(task.env={mass_dim_task}, environment={mass_dim_env})"
+                )
+                if md == 4:
+                    print("[loopz] priv_tail names: [mass, com_x, com_y, com_z]")
+                elif md == 8:
+                    print("[loopz] priv_tail names: [mass, com_x, com_y, com_z, k_drag, thr_L, thr_R, k_Iz]")
+                print(f"[loopz] priv_tail mean: {tail_mean}")
+                print(f"[loopz] priv_tail  std: {tail_std}")
+                print(f"[loopz] priv_tail  min: {tail_min}")
+                print(f"[loopz] priv_tail  max: {tail_max}")
+                print(f"[loopz] priv_tail sample0: {tail[0]}")
+                if _dbg_print_obs:
+                    _print_obs_debug(obs, header="reset")
+            else:
+                print(f"[loopz] priv_tail sanity skipped: obs shape={getattr(obs, 'shape', None)} mass_dim={md}")
+        except Exception as _e:
+            print(f"[loopz] priv_tail sanity failed: {_e}")
+
+
+    # TODO:这里要处理
 
     # 计算每个轮次的 rollout 步数。
     # - rl_games/train111 使用 train.params.config.horizon_length（默认 16），每次 update 只采样短 rollout
@@ -314,6 +799,7 @@ def parse_hydra_configs(cfg: DictConfig):
                                     mass_dim = mass_dim,
                                     mass_latent_dim = mass_latent_dim,
                                     mass_encoder_shape = mass_encoder_shape,
+                                    # mass_skip_dim = mass_skip_dim,
                                     # n_futures = n_futures
                                     ),
                                     ppo_module.SquashedGaussianDiagonalCovariance(act_dim, init_var, action_scale=action_scale),
@@ -328,6 +814,7 @@ def parse_hydra_configs(cfg: DictConfig):
                                                 mass_dim = mass_dim,
                                                 mass_latent_dim = mass_latent_dim,
                                                 mass_encoder_shape = mass_encoder_shape,
+                                                # mass_skip_dim = mass_skip_dim,
                                                 # n_futures = n_futures
                                                 ),
                                     device_type)
@@ -484,6 +971,25 @@ def parse_hydra_configs(cfg: DictConfig):
         t_rollout0 = time.time()
         env_step_dt_sum = 0.0
         env_step_dt_max = 0.0
+
+        # Debug: print obs stats every N updates (rank0 only)
+        do_dbg_update = (
+            rank == 0
+            and (_dbg_print_obs or _dbg_print_priv)
+            and int(_dbg_every) > 0
+            and (update % int(_dbg_every) == 0)
+        )
+        do_policy_stats_update = (
+            rank == 0
+            and _dbg_policy_sens
+            and int(_dbg_policy_every) > 0
+            and (update % int(_dbg_policy_every) == 0)
+        )
+        dbg_sample_steps = {0, int(n_steps // 2), int(max(n_steps - 1, 0))}
+        dbg_env0_encoded = {}
+        dbg_env0_raw = {}
+        dbg_env0_done_steps = []
+
         for step in range(n_steps):
             # Rollout trace: keep the first few steps verbose, then go quiet.
             if step == 0:
@@ -501,6 +1007,32 @@ def parse_hydra_configs(cfg: DictConfig):
             obs = env.observe(not freeze_encoder)
             if step == 0:
                 print(f"[loopz] step0: observe() took {time.time() - t0:.3f}s")
+
+            # Periodic debug summary at rollout step0.
+            if do_dbg_update and step == 0 and _dbg_print_obs:
+                try:
+                    _print_obs_debug(obs, header=f"u{update}/step0")
+                    if _dbg_policy_sens or _dbg_print_latent:
+                        _print_policy_sensitivity_debug(obs, header=f"u{update}/step0")
+                except Exception as _e:
+                    print(f"[loopz] u{update}/step0: obs debug failed: {_e}")
+
+            # Episode-constancy sampling (env0) at a few steps.
+            if do_dbg_update and _dbg_ep_const and isinstance(obs, np.ndarray) and obs.ndim == 2 and obs.shape[0] > 0:
+                if step in dbg_sample_steps:
+                    try:
+                        splits = _seg_slices(int(obs.shape[1]), int(speed_dim), int(act_dim), int(mass_dim))
+                        a, b = splits["priv_tail"]
+                        dbg_env0_encoded[int(step)] = np.array(obs[0, a:b], copy=True)
+                        raw = _get_raw_priv_params(getattr(env, "_task", None))
+                        if raw is not None:
+                            dbg_env0_raw[int(step)] = {
+                                k: float(np.asarray(raw[k]).reshape(-1)[0])
+                                for k in ("k_drag", "thr_L", "thr_R", "k_Iz")
+                                if k in raw and np.size(raw[k]) > 0
+                            }
+                    except Exception:
+                        pass
             # 根据观察计算动作
             t1 = time.time() if step == 0 else None
             action = ppo.observe(obs)
@@ -572,6 +1104,19 @@ def parse_hydra_configs(cfg: DictConfig):
                     done_frac = float(np.mean(dones))
                 except Exception:
                     done_frac = float('nan')
+
+            # Track env0 resets within this rollout for const-check interpretation.
+            if do_dbg_update and _dbg_ep_const:
+                try:
+                    d0 = None
+                    if torch.is_tensor(dones):
+                        d0 = bool(dones[0].item())
+                    else:
+                        d0 = bool(np.asarray(dones).reshape(-1)[0])
+                    if d0:
+                        dbg_env0_done_steps.append(int(step))
+                except Exception:
+                    pass
 
             # Finalize episodes on done, push into sliding windows, then reset per-env accumulators.
             try:
@@ -658,10 +1203,75 @@ def parse_hydra_configs(cfg: DictConfig):
             reward_ll_sum = reward_ll_sum + sum(reward)
             # forwardX_sum/penalty_sum 的累计仅用于回退分支；如果走 extras 分支则不再需要
 
+        # Debug: episode-constancy summary for env0 (encoded + raw)
+        if do_dbg_update and _dbg_ep_const and rank == 0 and len(dbg_env0_encoded) >= 2:
+            try:
+                steps_sorted = sorted(dbg_env0_encoded.keys())
+                sN = steps_sorted[-1]
+                # If env0 reset happened mid-rollout, compare only within the last post-reset segment.
+                last_done = None
+                if len(dbg_env0_done_steps) > 0:
+                    last_done = int(max(dbg_env0_done_steps))
+                s0 = steps_sorted[0]
+                if last_done is not None and last_done < sN:
+                    # pick the first sampled step strictly after last_done
+                    post = [s for s in steps_sorted if s > last_done]
+                    if len(post) >= 1:
+                        s0 = int(post[0])
+                    print(f"[loopz] u{update}: env0 done/reset occurred at steps={sorted(set(dbg_env0_done_steps))}, comparing from step{s0} -> step{sN}")
+
+                dmax = float(np.max(np.abs(dbg_env0_encoded[sN] - dbg_env0_encoded[s0])))
+                print(f"[loopz] u{update}: env0 priv_tail const-check steps={steps_sorted} max_abs_delta={dmax:.4g}")
+                if int(mass_dim) in (4, 8):
+                    print(f"[loopz] u{update}: env0 priv_tail step{s0}: {dbg_env0_encoded[s0]}")
+                    print(f"[loopz] u{update}: env0 priv_tail step{sN}: {dbg_env0_encoded[sN]}")
+                if len(dbg_env0_raw) >= 2:
+                    r0 = dbg_env0_raw.get(s0, {})
+                    rN = dbg_env0_raw.get(sN, {})
+                    if len(r0) > 0 and len(rN) > 0:
+                        keys = sorted(set(r0.keys()).intersection(set(rN.keys())))
+                        deltas = {k: float(abs(rN[k] - r0[k])) for k in keys}
+                        print(f"[loopz] u{update}: env0 raw-params step{s0}: {r0}")
+                        print(f"[loopz] u{update}: env0 raw-params step{sN}: {rN}")
+                        print(f"[loopz] u{update}: env0 raw-params abs-delta: {deltas}")
+            except Exception as _e:
+                print(f"[loopz] u{update}: env0 const-check failed: {_e}")
+
         # 环境课程学习回调（可能调整难度等）
         env.curriculum_callback()
         # 获取最后一步的观察用于价值函数计算
         obs = env.observe(not freeze_encoder)
+
+        # Periodic debug summary post-rollout (before PPO.update)
+        policy_sens_stats = None
+
+        if do_dbg_update and rank == 0 and _dbg_print_obs:
+            try:
+                _print_obs_debug(obs, header=f"u{update}/post")
+                if _dbg_policy_sens or _dbg_print_latent:
+                    policy_sens_stats = _print_policy_sensitivity_debug(obs, header=f"u{update}/post")
+            except Exception as _e:
+                print(f"[loopz] u{update}/post: obs debug failed: {_e}")
+
+        # Log policy_sens coupling metrics to TensorBoard stats/* every N updates.
+        if do_policy_stats_update and rank == 0:
+            try:
+                if policy_sens_stats is None:
+                    # Avoid duplicate printing when we're only logging stats.
+                    prev_print = _dbg_policy_print
+                    _dbg_policy_print = False
+                    policy_sens_stats = _print_policy_sensitivity_debug(obs, header=f"u{update}/policy_sens")
+                    _dbg_policy_print = prev_print
+
+                if isinstance(policy_sens_stats, dict) and hasattr(ppo, "writer"):
+                    for k, v in policy_sens_stats.items():
+                        try:
+                            ppo.writer.add_scalar(f"stats/{k}", float(v), update)
+                        except Exception:
+                            pass
+            except Exception as _e:
+                print(f"[loopz] u{update}: policy_sens stats logging failed: {_e}")
+
         # 执行PPO更新，使用观察更新Actor和Critic
         ppo.update(
             actor_obs=obs,
@@ -783,6 +1393,21 @@ def parse_hydra_configs(cfg: DictConfig):
                 'Episode/avg_reward_raw': avg_reward_raw,
                 'Policy/action_saturation_rate': float(action_saturation_rate),
             }
+
+            # Also log policy_sens coupling metrics (stats/*) when they were computed this update.
+            try:
+                if isinstance(policy_sens_stats, dict):
+                    for k, v in policy_sens_stats.items():
+                        try:
+                            fv = float(v)
+                        except Exception:
+                            continue
+                        if not math.isfinite(fv):
+                            continue
+                        log_payload[f'stats/{k}'] = fv
+            except Exception:
+                pass
+
             if episode_means is not None:
                 for k, v in episode_means.items():
                     log_payload[f'Episode/{k}'] = v

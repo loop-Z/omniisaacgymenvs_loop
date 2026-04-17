@@ -187,7 +187,9 @@ class MLPEncode(nn.Module):
                  output_size, output_activation_fn = None, small_init= False,\
                       speed_dim = 3, mass_dim = 4,
                       mass_latent_dim: int = 8,
-                      mass_encoder_shape = (64, 16)):
+                      mass_encoder_shape = (64, 16),
+                    #   mass_skip_dim: int = 0
+                      ):
         # USV 观测协议：obs = [speed | task_state | mass_com]
         # - speed_dim: 速度维度（线速度 + 角速度）
         # - mass_dim : 质量+质心维度
@@ -273,9 +275,19 @@ class MLPEncode(nn.Module):
         # 将模块列表封装成顺序网络，作为 mass encoder
         self.mass_encoder = nn.Sequential(*modules_mass)
 
+        # Optional: skip-connection of raw mass/com features directly into the main MLP.
+        # This helps the actor learn conditional policies when the latent path is too weak.
+        # Typical use: mass_skip_dim=4 to inject [mass, com_x, com_y, com_z].
+        # try:
+        #     msd = int(mass_skip_dim)
+        # except Exception:
+        #     msd = 0
+        # msd = max(msd, 0)
+        # self.mass_skip_dim = int(min(msd, self.mass_dim))
+
         # creating the action encoder
-        # 主干输入：speed + task_state + mass_latent
-        main_in_dim = self.speed_dim + self.task_dim + self.mass_latent_dim
+        # 主干输入：speed + task_state + mass_latent (+ optional raw mass skip)
+        main_in_dim = self.speed_dim + self.task_dim + self.mass_latent_dim   # + self.mass_skip_dim
         modules = [nn.Linear(main_in_dim, shape[0]), self.activation_fn()]
         # scale 记录每个 Linear 层对应的初始化 gain
         scale = [np.sqrt(2)]
@@ -339,7 +351,13 @@ class MLPEncode(nn.Module):
         # 质量/质心单独编码
         mass_latent = self.mass_encoder(mass)
 
-        # 主干输入拼接并输出
+        # # 主干输入拼接并输出（可选 raw mass skip）
+        # if self.mass_skip_dim > 0:
+        #     mass_skip = mass[:, 0:self.mass_skip_dim]
+        #     return self.action_mlp(torch.cat([speed, task, mass_skip, mass_latent], dim=1))
+        
+        
+        
         return self.action_mlp(torch.cat([speed, task, mass_latent], dim=1))
 
 class MLPEncode_wrap(nn.Module):
@@ -347,7 +365,9 @@ class MLPEncode_wrap(nn.Module):
     def __init__(self, shape, actionvation_fn, input_size, output_size, output_activation_fn = None,
                  # small_init/base_obdim/geom_dim/n_futures 会原样传给内部的 MLPEncode
                  small_init= False, speed_dim = 3, mass_dim = 4,
-                 mass_latent_dim: int = 8, mass_encoder_shape = (64, 16)):
+                 mass_latent_dim: int = 8, mass_encoder_shape = (64, 16),
+                #  mass_skip_dim: int = 0
+                 ):
         # 调用父类 nn.Module 的初始化
         super(MLPEncode_wrap, self).__init__()
         # 创建真实的网络结构实例（注意：这里把它放在 self.architecture 字段里）
@@ -362,6 +382,7 @@ class MLPEncode_wrap(nn.Module):
             mass_dim=mass_dim,
             mass_latent_dim=mass_latent_dim,
             mass_encoder_shape=mass_encoder_shape,
+            # mass_skip_dim=mass_skip_dim,
         )
         # 透传输入形状，供 Actor/Critic 查询
         self.input_shape = self.architecture.input_shape
