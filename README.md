@@ -13,7 +13,7 @@ Our framework includes a highly parallelized environment with domain randomizati
 ---
 
 ## How to run - For Quick TEST
-1. **activate environment**
+1. **activate environment**<br />
 conda acivate RANSA
 cd ~/isaac_sim-2023.1.1/OmniIsaacGymEnvs
 2. **Training** 
