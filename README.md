@@ -17,7 +17,6 @@ Our framework includes a highly parallelized environment with domain randomizati
 conda acivate RANSA
 cd ~/isaac_sim-2023.1.1/OmniIsaacGymEnvs
 2. **Training** <br />
-
   USV_NAN_PROBE=1 LOOPZ_PRINT_PRIV=1 PYTHON_PATH omniisaacgymenvs/scripts/rlgames_train_loopz.py   task=USV/IROS2024/USV_Virtual_CaptureXY_SysID-TEST   +train=USV/USV_MLP   headless=True   num_envs=512
   USV_NAN_PROBE=1 PYTHON_PATH omniisaacgymenvs/scripts/dagger_usv_sysid_loopz.py task=USV/IROS2024/USV_Virtual_CaptureXY_SysID-TEST   +train=USV/USV_MLP   headless=True  num_envs=512 checkpoint=/home/loop/isaac_sim-2023.1.1/OmniIsaacGymEnvs/runs/USV/Apr13_15-48-58/nn/full_u7799_f3276800.pt
   PYTHON_PATH scripts/rlgames_train.py task=USV/IROS2024/USV_Virtual_CaptureXY_SysID-TEST train=USV/USV_PPOcontinuous_MLP headless=True enable_livestream=True experiment=Capture-TEST
