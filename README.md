@@ -13,14 +13,23 @@ Our framework includes a highly parallelized environment with domain randomizati
 ---
 
 ## How to run - For Quick TEST
+1. **activate environment**
+conda acivate RANSA
+cd ~/isaac_sim-2023.1.1/OmniIsaacGymEnvs
 1. **Training** 
+  USV_NAN_PROBE=1 LOOPZ_PRINT_PRIV=1 PYTHON_PATH omniisaacgymenvs/scripts/rlgames_train_loopz.py   task=USV/IROS2024/USV_Virtual_CaptureXY_SysID-TEST   +train=USV/USV_MLP   headless=True   num_envs=512
+  USV_NAN_PROBE=1 PYTHON_PATH omniisaacgymenvs/scripts/dagger_usv_sysid_loopz.py task=USV/IROS2024/USV_Virtual_CaptureXY_SysID-TEST   +train=USV/USV_MLP   headless=True  num_envs=512 checkpoint=/home/loop/isaac_sim-2023.1.1/OmniIsaacGymEnvs/runs/USV/Apr13_15-48-58/nn/full_u7799_f3276800.pt
   PYTHON_PATH scripts/rlgames_train.py task=USV/IROS2024/USV_Virtual_CaptureXY_SysID-TEST train=USV/USV_PPOcontinuous_MLP headless=True enable_livestream=True experiment=Capture-TEST
 
-2. **Test**
+3. **Test**
+  USV_NAN_PROBE=1 PYTHON_PATH omniisaacgymenvs/scripts/dagger_usv_viz_loopz.py task=USV/IROS2024/USV_Virtual_CaptureXY_SysID-TEST   +train=USV/USV_MLP   headless=False  num_envs=1 sysid.id_encoder_ckpt=runs/dagger_USV/Apr14_11-39-32/nn/id_encoder_400.pt sysid.action_mlp_ckpt=runs/dagger_USV/Apr14_11-39-32/nn/action_mlp_400.pt sysid.teacher_ckpt=runs/USV/Apr13_15-48-58/nn/full_u7799_f3276800.pt
   PYTHON_PATH scripts/rlgames_train.py task=USV/IROS2024/USV_Virtual_CaptureXY_SysID-TEST train=USV/USV_PPOcontinuous_MLP test=True checkpoint=runs/Capture-TEST/nn/Capture-TEST.pth num_envs=32
 
-3. **Loopz Play (loopz .pt checkpoints)**
+5. **Loopz Play (loopz .pt checkpoints)**
   PYTHON_PATH scripts/rlgames_play_loopz.py task=USV/IROS2024/USV_Virtual_CaptureXY_SysID-TEST train=USV/USV_MLP test=True checkpoint=runs/<EXP>/<RUN_ID>/nn/full_u<UPDATE>_f<GLOBAL_FRAME>.pt num_envs=1 headless=False
+   USV_NAN_PROBE=1 PYTHON_PATH omniisaacgymenvs/scripts/rlgames_play_loopz_compare.py task=USV/IROS2024/USV_Virtual_CaptureXY_SysID-TEST   +train=USV/USV_MLP   headless=False   num_envs=1 checkpoint=/home/loop/isaac_sim-2023.1.1/OmniIsaacGymEnvs/runs/USV/Apr13_15-48-58/nn/full_u7799_f3276800.pt
+  USV_NAN_PROBE=1 PYTHON_PATH omniisaacgymenvs/scripts/rlgames_play_loopz_compare.py task=USV/IROS2024/USV_Virtual_CaptureXY_SysID-TEST   +train=USV/USV_MLP   headless=False   num_envs=1 checkpoint=/home/loop/isaac_sim-2023.1.1/OmniIsaacGymEnvs/runs/USV/Apr13_15-48-58/nn/full_u7799_f3276800.pt
+  USV_NAN_PROBE=1 LOOPZ_PLAY_COMPAT_MODE=auto PYTHON_PATH omniisaacgymenvs/scripts/rlgames_play_loopz_old_compare.py task=USV/IROS2024/USV_Virtual_CaptureXY_SysID-TEST   +train=USV/USV_MLP   headless=False   num_envs=1 checkpoint=/home/loop/isaac_sim-2023.1.1/OmniIsaacGymEnvs/runs/USV/Mar18_15-48-26/nn/full_u1199_f9830400.pt
 
 
 ## Task Description - Capture + @
